@@ -1,0 +1,6 @@
+nmap/
+*.txt
+*.nmap
+*.gnmap
+*.xml
+hosts
