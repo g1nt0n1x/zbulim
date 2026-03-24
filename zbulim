@@ -125,20 +125,20 @@ if ! command -v nxc &>/dev/null; then
 else
     # ── Host discovery + /etc/hosts ───────────────────────────────────────────
     info "Enumerating target via SMB..."
-    NXC_INIT=$(nxc smb "$TARGET" --generate-hosts-file "${OUTDIR}/hosts" 2>&1) || true
+    NXC_INIT=$(nxc smb "$TARGET" --generate-hosts-file hosts 2>&1) || true
 
-    if [[ -s "${OUTDIR}/hosts" ]]; then
-        HOSTS_ENTRY=$(cat "${OUTDIR}/hosts")
+    if [[ -s "hosts" ]]; then
+        HOSTS_ENTRY=$(cat hosts)
         success "Hosts entry: ${BOLD}${HOSTS_ENTRY}${RESET}"
 
         if grep -qF "$TARGET" /etc/hosts 2>/dev/null; then
             warn "Target already present in /etc/hosts — skipping."
         else
-            if sudo tee -a /etc/hosts < "${OUTDIR}/hosts" > /dev/null 2>&1; then
+            if sudo tee -a /etc/hosts < hosts > /dev/null 2>&1; then
                 success "Appended to /etc/hosts"
             else
                 warn "Could not append to /etc/hosts. Run manually:"
-                echo -e "  ${DIM}cat ${OUTDIR}/hosts | sudo tee -a /etc/hosts${RESET}"
+                echo -e "  ${DIM}cat hosts | sudo tee -a /etc/hosts${RESET}"
             fi
         fi
     else
@@ -173,13 +173,13 @@ else
 
     # ── SMB signing ───────────────────────────────────────────────────────────
     info "Checking SMB signing..."
-    NXC_SIGN=$(nxc smb "$TARGET" --gen-relay-list "${OUTDIR}/signing-off.txt" 2>&1) || true
+    NXC_SIGN=$(nxc smb "$TARGET" --gen-relay-list signing-off.txt 2>&1) || true
 
-    if [[ -s "${OUTDIR}/signing-off.txt" ]]; then
+    if [[ -s "signing-off.txt" ]]; then
         alert "$YELLOW" \
             "SMB SIGNING NOT REQUIRED" \
             "Target is vulnerable to SMB relay attacks." \
-            "Saved to: ${OUTDIR}/signing-off.txt"
+            "Saved to: signing-off.txt"
     else
         info "SMB signing is required — relay not possible."
     fi
@@ -190,15 +190,15 @@ else
 
         if $NULL_AUTH; then
             info "Enumerating shares via null session..."
-            nxc smb "$TARGET" -u '' -p '' --shares > "${OUTDIR}/shares-null.txt" 2>&1 || true
-            SHARE_COUNT=$(grep -cP 'READ|WRITE' "${OUTDIR}/shares-null.txt" || true)
-            success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${OUTDIR}/shares-null.txt"
+            nxc smb "$TARGET" -u '' -p '' --shares > shares-null.txt 2>&1 || true
+            SHARE_COUNT=$(grep -cP 'READ|WRITE' shares-null.txt || true)
+            success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to shares-null.txt"
 
             info "Enumerating users via null session..."
-            nxc smb "$TARGET" -u '' -p '' --users --users-export "${OUTDIR}/users-null.txt" > /dev/null 2>&1 || true
-            if [[ -s "${OUTDIR}/users-null.txt" ]]; then
-                USER_COUNT=$(wc -l < "${OUTDIR}/users-null.txt")
-                success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${OUTDIR}/users-null.txt"
+            nxc smb "$TARGET" -u '' -p '' --users --users-export users-null.txt > /dev/null 2>&1 || true
+            if [[ -s "users-null.txt" ]]; then
+                USER_COUNT=$(wc -l < users-null.txt)
+                success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to users-null.txt"
             else
                 warn "No users returned via null session."
             fi
@@ -206,15 +206,15 @@ else
 
         if $GUEST_AUTH; then
             info "Enumerating shares via guest login..."
-            nxc smb "$TARGET" -u 'guest' -p '' --shares > "${OUTDIR}/shares-guest.txt" 2>&1 || true
-            SHARE_COUNT=$(grep -cP 'READ|WRITE' "${OUTDIR}/shares-guest.txt" || true)
-            success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${OUTDIR}/shares-guest.txt"
+            nxc smb "$TARGET" -u 'guest' -p '' --shares > shares-guest.txt 2>&1 || true
+            SHARE_COUNT=$(grep -cP 'READ|WRITE' shares-guest.txt || true)
+            success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to shares-guest.txt"
 
             info "Enumerating users via guest login..."
-            nxc smb "$TARGET" -u 'guest' -p '' --users --users-export "${OUTDIR}/users-guest.txt" > /dev/null 2>&1 || true
-            if [[ -s "${OUTDIR}/users-guest.txt" ]]; then
-                USER_COUNT=$(wc -l < "${OUTDIR}/users-guest.txt")
-                success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${OUTDIR}/users-guest.txt"
+            nxc smb "$TARGET" -u 'guest' -p '' --users --users-export users-guest.txt > /dev/null 2>&1 || true
+            if [[ -s "users-guest.txt" ]]; then
+                USER_COUNT=$(wc -l < users-guest.txt)
+                success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to users-guest.txt"
             else
                 warn "No users returned via guest login."
             fi
@@ -284,10 +284,10 @@ echo -e "${GREEN}${BOLD}└─────────────────�
 echo -e "  ${DIM}Target   :${RESET} ${BOLD}${TARGET}${RESET}"
 [[ -n "${TCP_PORTS}" ]]  && echo -e "  ${DIM}TCP      :${RESET} ${TCP_PORTS}"
 [[ -n "${UDP_PORTS}" ]]  && echo -e "  ${DIM}UDP      :${RESET} ${UDP_PORTS}"
-[[ -f "${OUTDIR}/hosts" ]] && echo -e "  ${DIM}Hosts    :${RESET} $(cat "${OUTDIR}/hosts")"
+[[ -f "hosts" ]] && echo -e "  ${DIM}Hosts    :${RESET} $(cat hosts)"
 $NULL_AUTH  && echo -e "  ${DIM}Null Auth:${RESET} ${BOLD}${GREEN}Yes${RESET}"
 $GUEST_AUTH && echo -e "  ${DIM}Guest    :${RESET} ${BOLD}${GREEN}Yes${RESET}"
-[[ -s "${OUTDIR}/signing-off.txt" ]] && echo -e "  ${DIM}Signing  :${RESET} ${BOLD}${YELLOW}Not Required${RESET}"
-echo -e "  ${DIM}Output   :${RESET} ${OUTDIR}/"
+[[ -s "signing-off.txt" ]] && echo -e "  ${DIM}Signing  :${RESET} ${BOLD}${YELLOW}Not Required${RESET}"
+echo -e "  ${DIM}Scans    :${RESET} ${OUTDIR}/"
 echo -e "  ${DIM}Elapsed  :${RESET} $(elapsed)"
 echo
