@@ -1,4 +1,6 @@
 nmap/
+recon/
+loot/
 *.txt
 *.nmap
 *.gnmap

