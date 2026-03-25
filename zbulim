@@ -348,12 +348,18 @@ else
             fi
 
             info "Enumerating users via null session..."
-            nxc smb "$TARGET" -u '' -p '' --users --users-export "${RECONDIR}/users-null.txt" > /dev/null 2>&1 || true
+            USERS_OUT=$(nxc smb "$TARGET" -u '' -p '' --users --users-export "${RECONDIR}/users-null.txt" 2>&1) || true
             rm_if_empty "${RECONDIR}/users-null.txt"
             fix_owner "${RECONDIR}/users-null.txt"
             if [[ -s "${RECONDIR}/users-null.txt" ]]; then
                 USER_COUNT=$(wc -l < "${RECONDIR}/users-null.txt")
                 success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${RECONDIR}/users-null.txt"
+                # Show clean user table: strip nxc prefix, skip info lines, deduplicate
+                echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
+                    grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' | \
+                    awk '!seen[$0]++' | \
+                    while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
                 merge_users "${RECONDIR}/users-null.txt"
             else
                 warn "No users returned via null session."
@@ -369,12 +375,17 @@ else
             fi
 
             info "Enumerating users via guest login..."
-            nxc smb "$TARGET" -u 'guest' -p '' --users --users-export "${RECONDIR}/users-guest.txt" > /dev/null 2>&1 || true
+            USERS_OUT=$(nxc smb "$TARGET" -u 'guest' -p '' --users --users-export "${RECONDIR}/users-guest.txt" 2>&1) || true
             rm_if_empty "${RECONDIR}/users-guest.txt"
             fix_owner "${RECONDIR}/users-guest.txt"
             if [[ -s "${RECONDIR}/users-guest.txt" ]]; then
                 USER_COUNT=$(wc -l < "${RECONDIR}/users-guest.txt")
                 success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${RECONDIR}/users-guest.txt"
+                echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
+                    grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' | \
+                    awk '!seen[$0]++' | \
+                    while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
                 merge_users "${RECONDIR}/users-guest.txt"
             else
                 warn "No users returned via guest login."
