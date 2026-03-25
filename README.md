@@ -11,7 +11,7 @@ LDAP enum    →  ASREPRoast, Kerberoast, delegation, PASSWD_NOTREQD, adminCount
 Multi-proto  →  test null/guest on RDP, WinRM, MSSQL, FTP, SSH
 Password spray → username-as-password against SMB
 TCP sweep    →  full port scan → targeted -sCV on open ports
-UDP sweep    →  top-1000 scan → targeted -sUCV on open ports
+UDP sweep    →  full port scan → targeted -sUCV on open ports
 Summary      →  key findings at a glance
 ```
 
