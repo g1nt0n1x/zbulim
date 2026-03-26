@@ -53,7 +53,7 @@ sudo zbulim 10.10.10.1                   # enables UDP scans
 | 6 | **LDAP Enum** | ASREPRoast, Kerberoast, delegation, `PASSWD_NOTREQD`, `adminCount=1` (gated on 389/636) |
 | 7 | **Multi-Protocol** | Test null/guest auth on RDP (3389), WinRM (5985/5986), MSSQL (1433), FTP (21), SSH (22) — each gated on its port |
 | 8 | **Password Spray** | Username-as-password spray against SMB (prompted at start; re-prompted after summary if skipped) |
-| 9 | **TCP Targeted** | `-sCV --version-intensity 9` on discovered open ports |
+| 9 | **TCP Targeted** | `-sCV --version-intensity 7` on discovered open ports |
 | 10 | **UDP Sweep** | Full port scan → targeted `-sUCV --version-intensity 9` (requires root) |
 | 11 | **Summary** | Key findings, generated files, optional spray re-prompt, exit confirmation |
 
