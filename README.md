@@ -130,25 +130,39 @@ sudo chmod +x /usr/local/bin/zbulim
 - `sudo` - for UDP scans and `/etc/hosts` update
 
 ## To Do
-- zbulim works very well for Windows AD machines and their ports: DNS, Kerberos, LDAP, etc.
-- But what if it a Linux OS with a webserver installed?
+- zbulim works very well for Windows AD machines and their ports: DNS, Kerberos, LDAP, etc. which we mainly enumerate using the fantabolous tool nxc. 
+- But what if it a Linux OS with a webserver installed, or database server? 
 - An initial recon with Web enumeration like dir busting, sublisting, etc. is also very useful.
 - A pentest a always starts with an initial port scan, then we analyze the ports.
-- So after the initial nmap scan, the scripts starts the real recon:
--   SMB (445): Everything is in zbulim now
+- The goal is to have always automated recon running.
+- And instead of having one big script, wouldnt it be better to split this into multiple scripts? the current zbulim script stand alone is 1000 rows long, and that is only nxc + nmap!
+- I checked online and there are already a lot of cool tools out there! I just want to cerate my own custom one, and make it inshaAllah even better!
+- nmapautomator is quite a good tool, just like mine! It start with a host, check which hosts are up, and then does a quick port sweep to check what ports are up, enumerate the services with a version scan, and then it also uses tools to enumerate, something which I also want to add is to add nmap vuln scripts, and do actual good vuln scans.
+- Tools to integrate from nmapautomator:
+-   wpscan: port 80 for wordpress sites
+-   sslscan to audit the SSL/TLS configuration of servers (very imporant, no need to run these very specific tools on all sites, first need to confirm and validate it is this kind, maybe even input, but I need to clearly structure it)
+-   droopescan for CMS website (same thing as above)
+-   joomscan for Joomla‑based websites
+-   dnsrecon for dns
+-   ODAT for oracle DB for default port 1521
+-   snmp tools: smtp-user-enum	snmp-check	snmpwalk
+- So after the initial nmap scan, the scripts starts the real recon (these are just my thoughts and tools I use):
+-   SMB (445): Most is in zbulim now, could add - after identified null/guest auth - ldapsearch, etc. and create own folder.
 -   HTTP (80):
 -     Feroxbuster: deep path mapping
 -     FUFF: directory discovery, virtual host identification, and parameter manipulation
 -     Gobuster: Traditional directory and DNS brute-forcing; often used for straightforward path discovery.
 -     Nikto: Automated vulnerability scanning for misconfigurations, outdated versions, and dangerous files.
 -     Does not matter what tools are used, the goal is to utilize the most effective way to get the recon done.
--   Kerberos (88): Check for kerberoastable users with the users file we attained from SMB
+-   Kerberos (88): Check for kerberoastable users with the users file we attained from SMB, or other tools, the options are limitless!
 -   DNS (53):
 -     Dig Querying DNS records and attempting zone transfers to map internal networks.
 -     Nmblookup	Resolving NetBIOS names over TCP/IP to identify hostnames.
 -     Nslookup	Directly querying name servers for domain name or IP address mapping.
--   etc. 
-My goal is to do a fully functioning initial recon script for any OS which will appear on the OSCP, saving immense time, and providing a clear initial foothold.
+-   etc. etc. etc. I want to focus now on the most commmon ones and not to go too much astray.
+My goal is to do a fully functioning initial recon script for any OS which will appear on the OSCP, saving immense time, and providing a clear initial recon.
+And what I really want to add is, instead of having to wait for everything, it would be better to split them. So for instance, after having the port sweep, knowing that http is open, we can directy scan with direcotry busting, path mapping, etc. no actuall need for a normal port scan. We can safe time.
+Furthermore, I have in the end a "result" page, but I want to remove this for now, just to make sure everything works, every output is correct, so I would still like to see the most important output. And very important, every output, every command is saved onto a file, just like nmap.  
 
 As we are aware, the OSCP requires pivoting, this may be something  I will add to the future. 
 
