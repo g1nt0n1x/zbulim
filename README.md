@@ -129,6 +129,29 @@ sudo chmod +x /usr/local/bin/zbulim
 - `bash` 4+
 - `sudo` - for UDP scans and `/etc/hosts` update
 
+## To Do
+- zbulim works very well for Windows AD machines and their ports: DNS, Kerberos, LDAP, etc.
+- But what if it a Linux OS with a webserver installed?
+- An initial recon with Web enumeration like dir busting, sublisting, etc. is also very useful.
+- A pentest a always starts with an initial port scan, then we analyze the ports.
+- So after the initial nmap scan, the scripts starts the real recon:
+-   SMB (445): Everything is in zbulim now
+-   HTTP (80):
+-     Feroxbuster: deep path mapping
+-     FUFF: directory discovery, virtual host identification, and parameter manipulation
+-     Gobuster: Traditional directory and DNS brute-forcing; often used for straightforward path discovery.
+-     Nikto: Automated vulnerability scanning for misconfigurations, outdated versions, and dangerous files.
+-     Does not matter what tools are used, the goal is to utilize the most effective way to get the recon done.
+-   Kerberos (88): Check for kerberoastable users with the users file we attained from SMB
+-   DNS (53):
+-     Dig Querying DNS records and attempting zone transfers to map internal networks.
+-     Nmblookup	Resolving NetBIOS names over TCP/IP to identify hostnames.
+-     Nslookup	Directly querying name servers for domain name or IP address mapping.
+-   etc. 
+My goal is to do a fully functioning initial recon script for any OS which will appear on the OSCP, saving immense time, and providing a clear initial foothold.
+
+As we are aware, the OSCP requires pivoting, this may be something  I will add to the future. 
+
 ## Author
 
 **g1nt0n1x**
