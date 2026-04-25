@@ -130,6 +130,11 @@ sudo chmod +x /usr/local/bin/zbulim
 - `sudo` - for UDP scans and `/etc/hosts` update
 
 ## To Do
+new:
+ffuf -u http://titanic.htb -H "Host: FUZZ.titanic.htb" -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-20000.txt -ac -> instead of domain, prompt to ask the domain name for the IP...
+Feroxbuster fails and does not give good output.
+
+old:
 - zbulim works very well for Windows AD machines and their ports: DNS, Kerberos, LDAP, etc. which we mainly enumerate using the fantabolous tool nxc. 
 - But what if it a Linux OS with a webserver installed, or database server? 
 - An initial recon with Web enumeration like dir busting, sublisting, etc. is also very useful.
