@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# zbulim v2 (Albanian: reconnaissance/discovery)
+# Port-based recon automation: quick scan → enumerate per port → full scan → summary
+# author: g1nt0n1x
+# https://github.com/g1nt0n1x/zbulim
+
+set -euo pipefail
+
+# ── Locate and source modules ─────────────────────────────────────────────────
+ZBULIM_DIR=""
+if [[ -d "$(dirname "$0")/modules" ]]; then
+    ZBULIM_DIR="$(cd "$(dirname "$0")" && pwd)"
+elif [[ -d "/usr/local/share/zbulim/modules" ]]; then
+    ZBULIM_DIR="/usr/local/share/zbulim"
+fi
+
+if [[ -z "$ZBULIM_DIR" ]]; then
+    echo "Error: cannot find zbulim modules directory."
+    exit 1
+fi
+
+source "${ZBULIM_DIR}/modules/common.sh"
+source "${ZBULIM_DIR}/modules/scan.sh"
+source "${ZBULIM_DIR}/modules/port_ftp.sh"
+source "${ZBULIM_DIR}/modules/port_ssh.sh"
+source "${ZBULIM_DIR}/modules/port_smtp.sh"
+source "${ZBULIM_DIR}/modules/port_dns.sh"
+source "${ZBULIM_DIR}/modules/port_http.sh"
+source "${ZBULIM_DIR}/modules/port_kerberos.sh"
+source "${ZBULIM_DIR}/modules/port_nfs.sh"
+source "${ZBULIM_DIR}/modules/port_rpc.sh"
+source "${ZBULIM_DIR}/modules/port_smb.sh"
+source "${ZBULIM_DIR}/modules/port_snmp.sh"
+source "${ZBULIM_DIR}/modules/port_ldap.sh"
+source "${ZBULIM_DIR}/modules/port_mssql.sh"
+source "${ZBULIM_DIR}/modules/port_mysql.sh"
+source "${ZBULIM_DIR}/modules/port_rdp.sh"
+source "${ZBULIM_DIR}/modules/port_postgresql.sh"
+source "${ZBULIM_DIR}/modules/port_vnc.sh"
+source "${ZBULIM_DIR}/modules/port_winrm.sh"
+source "${ZBULIM_DIR}/modules/port_redis.sh"
+source "${ZBULIM_DIR}/modules/port_ajp.sh"
+source "${ZBULIM_DIR}/modules/port_mongodb.sh"
+source "${ZBULIM_DIR}/modules/summary.sh"
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    echo -e "${BOLD}Usage:${RESET}"
+    echo "  zbulim <target> [target2 ...] [options]"
+    echo
+    echo -e "${BOLD}Arguments:${RESET}"
+    echo "  target           IP address, hostname, or CIDR range"
+    echo
+    echo -e "${BOLD}Options:${RESET}"
+    echo "  -o, --output DIR   Base directory for nmap results (default: ./nmap)"
+    echo "  --local-auth       Pass --local-auth to all nxc commands"
+    echo "  --skip-nmap        Skip all nmap scans (use previous results)"
+    echo "  --skip-clock       Skip clock sync via ntpdate"
+    echo "  -h, --help         Show this help message"
+    echo
+    echo -e "${BOLD}Environment variables:${RESET}"
+    echo "  ZBULIM_WL_DIRS     Custom wordlist for directory enumeration"
+    echo "  ZBULIM_WL_VHOSTS   Custom wordlist for vhost enumeration"
+    echo
+    echo -e "${BOLD}Phases:${RESET}"
+    echo "  1. Quick TCP scan (top 1000) — fast port discovery"
+    echo "  2. Enumerate each open port with matching module"
+    echo "  3. Full TCP scan (all 65535) — background, enumerate new ports"
+    echo "  4. UDP scan — SNMP, DNS, etc."
+    echo "  5. Summary — consolidated findings"
+    echo
+    echo -e "${BOLD}Output:${RESET}"
+    echo "  ./recon/         Recon results + zbulim.log"
+    echo "  ./loot/          Downloaded files (FTP, SMB shares)"
+    echo "  ./nmap/          All nmap scan results"
+    echo
+    echo -e "${BOLD}Examples:${RESET}"
+    echo "  sudo zbulim 10.10.10.1"
+    echo "  sudo zbulim 10.10.10.0/24"
+    echo "  sudo zbulim 10.10.10.1 -o ./scans --local-auth"
+    exit 0
+}
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+TARGETS=()
+OUTDIR_BASE="nmap"
+SKIP_NMAP=false
+SKIP_CLOCK=false
+LOCAL_AUTH=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    banner; usage ;;
+        --skip-nmap)  SKIP_NMAP=true; shift ;;
+        --skip-clock) SKIP_CLOCK=true; shift ;;
+        --local-auth) LOCAL_AUTH=true; shift ;;
+        -o|--output)  OUTDIR_BASE="$2"; shift 2 ;;
+        -*)           fail "Unknown option: $1"; echo "Use -h for help."; exit 1 ;;
+        *)            TARGETS+=("$1"); shift ;;
+    esac
+done
+
+[[ ${#TARGETS[@]} -eq 0 ]] && banner && usage
+
+START_TIME=$(date +%s)
+banner
+
+# ── Require root ──────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    fail "zbulim must run as root (sudo). Needed for clock sync, UDP scans, /etc/hosts."
+    info "Re-run with: ${BOLD}sudo zbulim ${TARGETS[*]}${RESET}"
+    exit 1
+fi
+
+# ── CIDR expansion ────────────────────────────────────────────────────────────
+EXPANDED_TARGETS=()
+for T in "${TARGETS[@]}"; do
+    if [[ "$T" =~ / ]]; then
+        section "CIDR Ping Sweep: $T"
+        info "Discovering live hosts in ${BOLD}${T}${RESET}..."
+        mapfile -t LIVE < <(nmap -sn --min-rate 5000 -oG - "$T" 2>/dev/null | awk '/Up$/{print $2}')
+        if [[ ${#LIVE[@]} -eq 0 ]]; then
+            warn "No live hosts found in $T — skipping."
+        else
+            success "Found ${BOLD}${#LIVE[@]}${RESET} live host(s): ${LIVE[*]}"
+            EXPANDED_TARGETS+=("${LIVE[@]}")
+        fi
+    else
+        EXPANDED_TARGETS+=("$T")
+    fi
+done
+TARGETS=("${EXPANDED_TARGETS[@]}")
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    fail "No live targets to scan."
+    exit 1
+fi
+
+info "Targets : ${BOLD}${TARGETS[*]}${RESET}"
+info "Nmap    : ${BOLD}${OUTDIR_BASE}/${RESET}"
+$SKIP_NMAP   && info "Nmap    : ${BOLD}${YELLOW}SKIPPED${RESET}"
+$SKIP_CLOCK  && info "Clock   : ${BOLD}${YELLOW}SKIPPED${RESET}"
+$LOCAL_AUTH   && info "Auth    : ${BOLD}${YELLOW}--local-auth${RESET}"
+info "Started : $(date '+%Y-%m-%d %H:%M:%S')"
+echo
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# count_modules — count how many modules will run for this target
+# ═══════════════════════════════════════════════════════════════════════════════
+count_modules() {
+    local ports="$1"
+    local count=0
+    echo ",$ports," | grep -q ',21,'    && (( count++ )) || true
+    echo ",$ports," | grep -q ',22,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',25,|,587,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',53,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',80,|,443,|,8080,|,8443,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',88,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',111,|,2049,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',135,'   && (( count++ )) || true
+    echo ",$ports," | grep -qP ',139,|,445,' && (( count++ )) || true
+    echo ",$ports," | grep -qP ',389,|,636,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',1433,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',3306,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',3389,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',5432,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',5900,'  && (( count++ )) || true
+    echo ",$ports," | grep -qP ',5985,|,5986,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',6379,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',8009,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',27017,' && (( count++ )) || true
+    echo "$count"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# run_port_modules — run the right module for each open port
+# ═══════════════════════════════════════════════════════════════════════════════
+run_port_modules() {
+    local target="$1"
+    local ports="$2"
+
+    [[ -z "$ports" ]] && return
+
+    # order: SMB first (gets hostname/domain), then HTTP (gets domain), then rest
+    echo ",$ports," | grep -qP ',139,|,445,' && enum_smb "$target"
+    echo ",$ports," | grep -qP ',80,|,443,|,8080,|,8443,' && enum_http "$target" "$OUTDIR"
+    echo ",$ports," | grep -q ',53,'    && enum_dns "$target"
+    echo ",$ports," | grep -q ',21,'    && enum_ftp "$target"
+    echo ",$ports," | grep -q ',22,'    && enum_ssh "$target"
+    echo ",$ports," | grep -qP ',25,|,587,'  && enum_smtp "$target"
+    echo ",$ports," | grep -q ',88,'    && enum_kerberos "$target"
+    echo ",$ports," | grep -qP ',111,|,2049,' && enum_nfs "$target"
+    echo ",$ports," | grep -q ',135,'   && enum_rpc "$target"
+    echo ",$ports," | grep -qP ',389,|,636,' && enum_ldap "$target"
+    echo ",$ports," | grep -q ',1433,'  && enum_mssql "$target"
+    echo ",$ports," | grep -q ',3306,'  && enum_mysql "$target"
+    echo ",$ports," | grep -q ',3389,'  && enum_rdp "$target"
+    echo ",$ports," | grep -q ',5432,'  && enum_postgresql "$target"
+    echo ",$ports," | grep -q ',5900,'  && enum_vnc "$target"
+    echo ",$ports," | grep -qP ',5985,|,5986,' && enum_winrm "$target"
+    echo ",$ports," | grep -q ',6379,'  && enum_redis "$target"
+    echo ",$ports," | grep -q ',8009,'  && enum_ajp "$target"
+    echo ",$ports," | grep -q ',27017,' && enum_mongodb "$target"
+
+    # deferred DNS (needs DOMAIN from SMB or HTTP)
+    echo ",$ports," | grep -q ',53,' && enum_dns_deferred "$target"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# run_recon — main recon logic for a single target
+# ═══════════════════════════════════════════════════════════════════════════════
+run_recon() {
+    local TARGET="$1"
+
+    # ── Per-target directories ────────────────────────────────────────────────
+    if [[ ${#TARGETS[@]} -gt 1 ]]; then
+        RECONDIR="recon/${TARGET}"
+        OUTDIR="${OUTDIR_BASE}/${TARGET}"
+        LOOTDIR="loot/${TARGET}"
+    else
+        RECONDIR="recon"
+        OUTDIR="${OUTDIR_BASE}"
+        LOOTDIR="loot"
+    fi
+    mkdir -p "$OUTDIR" "$RECONDIR"
+    chown -R "$REAL_USER:$REAL_GROUP" "$RECONDIR" "$OUTDIR" 2>/dev/null || true
+
+    # ── Log file ──────────────────────────────────────────────────────────────
+    LOGFILE="${RECONDIR}/zbulim.log"
+    touch "$LOGFILE"
+    fix_owner "$LOGFILE"
+
+    # ── Per-target state ──────────────────────────────────────────────────────
+    TCP_PORTS=""
+    UDP_PORTS=""
+    NULL_AUTH=false
+    GUEST_AUTH=false
+    DOMAIN=""
+    HOSTNAME=""
+    DNS_DEFERRED=false
+    LOCKOUT_THRESHOLD="?"
+    MIN_PW_LEN="?"
+    PW_COMPLEX="?"
+
+    echo
+    echo -e "${MAGENTA}${BOLD}╔═══════════════════════════════════════════════════════════╗${RESET}"
+    printf "${MAGENTA}${BOLD}║  Target: %-48s ║${RESET}\n" "$TARGET"
+    echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════════════════════════╝${RESET}"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 0: Setup
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=0
+
+    if $SKIP_CLOCK; then
+        info "Clock sync: SKIPPED"
+    else
+        if command -v ntpdate &>/dev/null; then
+            info "Syncing clock with target..."
+            if ntpdate -s "$TARGET" 2>/dev/null; then
+                success "Clock synced with ${BOLD}${TARGET}${RESET}"
+            else
+                warn "ntpdate failed — Kerberos attacks may fail if clock skew > 5 min."
+            fi
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 1: Discovery
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=1
+    local QUICK_PORTS=""
+    local FULL_PID=""
+    local UDP_PID=""
+
+    if $SKIP_NMAP; then
+        section "Scans — SKIPPED (--skip-nmap)"
+        if [[ -f "${OUTDIR}/tcp-allports.gnmap" ]]; then
+            TCP_PORTS=$(extract_open_ports "${OUTDIR}/tcp-allports.gnmap" tcp)
+            [[ -n "$TCP_PORTS" ]] && info "Loaded previous TCP: ${TCP_PORTS}"
+        elif [[ -f "${OUTDIR}/tcp-quick.gnmap" ]]; then
+            TCP_PORTS=$(extract_open_ports "${OUTDIR}/tcp-quick.gnmap" tcp)
+            [[ -n "$TCP_PORTS" ]] && info "Loaded previous quick scan: ${TCP_PORTS}"
+        else
+            info "No previous scan found — all modules will run ungated."
+        fi
+        if [[ -f "${OUTDIR}/udp-allports.gnmap" ]]; then
+            UDP_PORTS=$(extract_open_ports "${OUTDIR}/udp-allports.gnmap" udp)
+            [[ -n "$UDP_PORTS" ]] && info "Loaded previous UDP: ${UDP_PORTS}"
+        fi
+        QUICK_PORTS="$TCP_PORTS"
+    else
+        # quick scan (foreground)
+        QUICK_PORTS=$(run_quick_scan "$TARGET" "$OUTDIR")
+        TCP_PORTS="$QUICK_PORTS"
+
+        # full scan (background)
+        FULL_PID=$(run_full_tcp_scan "$TARGET" "$OUTDIR")
+
+        # UDP scan (background)
+        UDP_PID=$(run_udp_scan "$TARGET" "$OUTDIR")
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 2: Quick Enumeration
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=2
+
+    if [[ -n "$TCP_PORTS" ]]; then
+        TOTAL_MODULES=$(count_modules "$TCP_PORTS")
+        CURRENT_MODULE=0
+        section "Phase 2 — Enumerating open ports"
+        run_port_modules "$TARGET" "$TCP_PORTS"
+    else
+        warn "No open TCP ports to enumerate."
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 3: Full TCP Scan Results
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=3
+
+    if [[ -n "${FULL_PID:-}" ]]; then
+        local all_ports
+        all_ports=$(wait_full_tcp_scan "$FULL_PID" "$OUTDIR" "$QUICK_PORTS")
+
+        if [[ -n "$all_ports" ]]; then
+            # find new ports
+            local new_ports=""
+            IFS=',' read -ra ALL_ARR <<< "$all_ports"
+            IFS=',' read -ra QUICK_ARR <<< "${QUICK_PORTS:-}"
+            for p in "${ALL_ARR[@]}"; do
+                local found=false
+                for q in "${QUICK_ARR[@]}"; do
+                    [[ "$p" == "$q" ]] && found=true && break
+                done
+                $found || new_ports="${new_ports:+$new_ports,}$p"
+            done
+
+            TCP_PORTS="$all_ports"
+
+            if [[ -n "$new_ports" ]]; then
+                local new_module_count
+                new_module_count=$(count_modules "$new_ports")
+                if [[ "$new_module_count" -gt 0 ]]; then
+                    TOTAL_MODULES=$new_module_count
+                    CURRENT_MODULE=0
+                    section "Phase 3 — Enumerating newly discovered ports"
+                    run_port_modules "$TARGET" "$new_ports"
+                fi
+            fi
+        fi
+
+        # targeted TCP scan
+        if ! $SKIP_NMAP && [[ -n "$TCP_PORTS" ]]; then
+            run_targeted_tcp_scan "$TARGET" "$OUTDIR" "$TCP_PORTS"
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 4: UDP Results
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=4
+
+    if [[ -n "${UDP_PID:-}" ]]; then
+        UDP_PORTS=$(wait_udp_scan "$UDP_PID" "$OUTDIR")
+
+        if [[ -n "$UDP_PORTS" ]]; then
+            # run UDP modules
+            local udp_modules=0
+            echo ",$UDP_PORTS," | grep -q ',161,' && (( udp_modules++ )) || true
+            echo ",$UDP_PORTS," | grep -q ',53,'  && (( udp_modules++ )) || true
+
+            if [[ "$udp_modules" -gt 0 ]]; then
+                TOTAL_MODULES=$udp_modules
+                CURRENT_MODULE=0
+                section "Phase 4 — UDP Enumeration"
+
+                if echo ",$UDP_PORTS," | grep -q ',161,'; then
+                    enum_snmp "$TARGET"
+                fi
+                if echo ",$UDP_PORTS," | grep -q ',53,'; then
+                    # DNS over UDP — run deferred if not done yet
+                    enum_dns_deferred "$TARGET"
+                fi
+            fi
+
+            # targeted UDP scan
+            if ! $SKIP_NMAP; then
+                run_targeted_udp_scan "$TARGET" "$OUTDIR" "$UDP_PORTS"
+            fi
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 5: Summary
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=5
+    print_summary "$TARGET"
+
+    info "Full log: ${LOGFILE}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main — loop over all targets
+# ═══════════════════════════════════════════════════════════════════════════════
+for T in "${TARGETS[@]}"; do
+    run_recon "$T"
+done
+
+echo
+echo -e "${GREEN}${BOLD}All ${#TARGETS[@]} target(s) complete.${RESET} Total elapsed: $(elapsed)"
