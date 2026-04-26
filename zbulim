@@ -1,195 +1,84 @@
 #!/usr/bin/env bash
-# zbulim (Albanian: reconnaissance/discovery)
-# automated AD/Windows recon: TCP scan (bg) → SMB enum → /etc/hosts → RID brute → LDAP
-#   → multi-protocol checks → web recon → kerbrute → nmap → summary
+# zbulim v2 (Albanian: reconnaissance/discovery)
+# Port-based recon automation: quick scan → enumerate per port → full scan → summary
 # author: g1nt0n1x
 # https://github.com/g1nt0n1x/zbulim
 
 set -euo pipefail
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-DIM='\033[2m'
-RESET='\033[0m'
+# ── Locate and source modules ─────────────────────────────────────────────────
+ZBULIM_DIR=""
+if [[ -d "$(dirname "$0")/modules" ]]; then
+    ZBULIM_DIR="$(cd "$(dirname "$0")" && pwd)"
+elif [[ -d "/usr/local/share/zbulim/modules" ]]; then
+    ZBULIM_DIR="/usr/local/share/zbulim"
+fi
 
-# ── Banner ────────────────────────────────────────────────────────────────────
-banner() {
-    echo -e "${CYAN}${BOLD}"
-    echo "  ███████╗██████╗ ██╗   ██╗██╗     ██╗███╗   ███╗"
-    echo "  ╚══███╔╝██╔══██╗██║   ██║██║     ██║████╗ ████║"
-    echo "    ███╔╝ ██████╔╝██║   ██║██║     ██║██╔████╔██║"
-    echo "   ███╔╝  ██╔══██╗██║   ██║██║     ██║██║╚██╔╝██║"
-    echo "  ███████╗██████╔╝╚██████╔╝███████╗██║██║ ╚═╝ ██║"
-    echo "  ╚══════╝╚═════╝  ╚═════╝ ╚══════╝╚═╝╚═╝     ╚═╝"
-    echo -e "${RESET}${DIM}         zbulim — recon automation by g1nt0n1x${RESET}"
-    echo
-}
+if [[ -z "$ZBULIM_DIR" ]]; then
+    echo "Error: cannot find zbulim modules directory."
+    exit 1
+fi
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-info()    { echo -e "${BOLD}${CYAN}[*]${RESET} $*"; }
-success() { echo -e "${BOLD}${GREEN}[+]${RESET} $*"; }
-warn()    { echo -e "${BOLD}${YELLOW}[!]${RESET} $*"; }
-fail()    { echo -e "${BOLD}${RED}[-]${RESET} $*"; }
-section() { echo -e "\n${BOLD}${CYAN}── $* ──${RESET}"; }
+source "${ZBULIM_DIR}/modules/common.sh"
+source "${ZBULIM_DIR}/modules/scan.sh"
+source "${ZBULIM_DIR}/modules/port_ftp.sh"
+source "${ZBULIM_DIR}/modules/port_ssh.sh"
+source "${ZBULIM_DIR}/modules/port_smtp.sh"
+source "${ZBULIM_DIR}/modules/port_dns.sh"
+source "${ZBULIM_DIR}/modules/port_http.sh"
+source "${ZBULIM_DIR}/modules/port_kerberos.sh"
+source "${ZBULIM_DIR}/modules/port_nfs.sh"
+source "${ZBULIM_DIR}/modules/port_rpc.sh"
+source "${ZBULIM_DIR}/modules/port_smb.sh"
+source "${ZBULIM_DIR}/modules/port_snmp.sh"
+source "${ZBULIM_DIR}/modules/port_ldap.sh"
+source "${ZBULIM_DIR}/modules/port_mssql.sh"
+source "${ZBULIM_DIR}/modules/port_mysql.sh"
+source "${ZBULIM_DIR}/modules/port_rdp.sh"
+source "${ZBULIM_DIR}/modules/port_postgresql.sh"
+source "${ZBULIM_DIR}/modules/port_vnc.sh"
+source "${ZBULIM_DIR}/modules/port_winrm.sh"
+source "${ZBULIM_DIR}/modules/port_redis.sh"
+source "${ZBULIM_DIR}/modules/port_ajp.sh"
+source "${ZBULIM_DIR}/modules/port_mongodb.sh"
+source "${ZBULIM_DIR}/modules/summary.sh"
 
-alert() {
-    local color="$1"; shift
-    local title="$1"; shift
-    echo
-    echo -e "${color}${BOLD}  ┌──────────────────────────────────────────────────────┐${RESET}"
-    printf "${color}${BOLD}  │ %-52s │${RESET}\n" "$title"
-    echo -e "${color}${BOLD}  ├──────────────────────────────────────────────────────┤${RESET}"
-    for line in "$@"; do
-        printf "${color}${BOLD}  │${RESET} %-52s ${color}${BOLD}│${RESET}\n" "$line"
-    done
-    echo -e "${color}${BOLD}  └──────────────────────────────────────────────────────┘${RESET}"
-    echo
-}
-
-# ── File ownership helper ─────────────────────────────────────────────────────
-REAL_USER="${SUDO_USER:-$(whoami)}"
-REAL_GROUP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
-
-safe_write() {
-    local dest="$1"
-    cat > "$dest"
-    if [[ ! -s "$dest" ]]; then
-        rm -f "$dest"
-        return 1
-    fi
-    chown "$REAL_USER:$REAL_GROUP" "$dest" 2>/dev/null || true
-    return 0
-}
-
-fix_owner() {
-    local f="$1"
-    if [[ -e "$f" ]]; then
-        chown "$REAL_USER:$REAL_GROUP" "$f" 2>/dev/null || true
-    fi
-}
-
-rm_if_empty() {
-    local f="$1"
-    if [[ -f "$f" && ! -s "$f" ]]; then
-        rm -f "$f"
-    fi
-}
-
-nxc_result() {
-    local output="$1"
-    local stripped
-    stripped=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-    local line
-    line=$(echo "$stripped" | grep -P '\[\+\]|\[-\]' | head -1) || true
-    [[ -z "$line" ]] && return
-    if echo "$line" | grep -qP '\[\+\]'; then
-        echo -e "  ${BOLD}${GREEN}${line}${RESET}"
-    else
-        echo -e "  ${BOLD}${RED}${line}${RESET}"
-    fi
-}
-
-merge_users() {
-    local src_file="$1"
-    [[ ! -s "$src_file" ]] && return
-
-    local tmp_users
-    tmp_users=$(mktemp)
-
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        local clean
-        clean=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g')
-        local user
-        user=$(echo "$clean" | awk '{print $1}' | sed 's/.*\\//' | sed 's/@.*//')
-        [[ -n "$user" && "$user" != "SMB" && "$user" != "LDAP" ]] && echo "$user" >> "$tmp_users"
-    done < "$src_file"
-
-    if [[ -s "$tmp_users" ]]; then
-        touch "${RECONDIR}/users.txt"
-        cat "${RECONDIR}/users.txt" "$tmp_users" | sort -uf > "${RECONDIR}/users.txt.tmp"
-        mv "${RECONDIR}/users.txt.tmp" "${RECONDIR}/users.txt"
-        fix_owner "${RECONDIR}/users.txt"
-    fi
-    rm -f "$tmp_users"
-}
-
-parse_rid_brute() {
-    local output="$1"
-    local rid_file="$2"
-
-    echo "$output" | sed 's/\x1b\[[0-9;]*m//g' | \
-        grep -i 'SidTypeUser' | \
-        grep -oP '\d+:\s+\S+\\(\K[^(\s]+)' | \
-        sed 's/[[:space:]]*$//' | \
-        sort -uf | safe_write "$rid_file" || true
-}
-
-# Returns true (0) if port is open, or if TCP_PORTS is unset/empty (ungated mode)
-port_open() {
-    local port="$1"
-    [[ -z "$TCP_PORTS" ]] && return 0
-    echo ",$TCP_PORTS," | grep -q ",$port,"
-}
-
+# ── Usage ─────────────────────────────────────────────────────────────────────
 usage() {
     echo -e "${BOLD}Usage:${RESET}"
     echo "  zbulim <target> [target2 ...] [options]"
     echo
     echo -e "${BOLD}Arguments:${RESET}"
-    echo "  target           IP address, hostname, or CIDR range (e.g. 10.10.10.0/24)"
+    echo "  target           IP address, hostname, or CIDR range"
     echo
     echo -e "${BOLD}Options:${RESET}"
     echo "  -o, --output DIR   Base directory for nmap results (default: ./nmap)"
     echo "  --local-auth       Pass --local-auth to all nxc commands"
-    echo "  --skip-nmap        Skip all nmap scans (useful for re-runs)"
+    echo "  --skip-nmap        Skip all nmap scans (use previous results)"
     echo "  --skip-clock       Skip clock sync via ntpdate"
     echo "  -h, --help         Show this help message"
     echo
+    echo -e "${BOLD}Environment variables:${RESET}"
+    echo "  ZBULIM_WL_DIRS     Custom wordlist for directory enumeration"
+    echo "  ZBULIM_WL_VHOSTS   Custom wordlist for vhost enumeration"
+    echo
     echo -e "${BOLD}Phases:${RESET}"
-    echo "  1. CIDR sweep   — ping sweep to discover live hosts (if CIDR given)"
-    echo "  2. TCP bg scan  — full port scan in background (nmap -p-)"
-    echo "  3. nxc smb      — host enum, null/guest auth, signing, shares, users [parallel]"
-    echo "  4. Spider+      — download accessible share files to ./loot/"
-    echo "  5. RID brute    — enumerate users via RID cycling (smb + mssql)"
-    echo "  6. Kerbrute     — user enum via Kerberos when no null/guest auth"
-    echo "  7. nxc ldap     — ASREPRoast, Kerberoast, delegation, pass policy"
-    echo "  8. Multi-proto  — test null/guest on rdp, winrm, mssql, ftp, ssh"
-    echo "  9. Web recon    — whatweb + feroxbuster/gobuster (ports 80/443/8080/8443)"
-    echo " 10. TCP targeted — -sCV on open ports"
-    echo " 11. UDP sweep    — top-1000 scan, then targeted -sUCV (requires sudo)"
-    echo " 12. Summary      — consolidated findings"
+    echo "  1. Quick TCP scan (top 1000) — fast port discovery"
+    echo "  2. Enumerate each open port with matching module"
+    echo "  3. Full TCP scan (all 65535) — background, enumerate new ports"
+    echo "  4. UDP scan — SNMP, DNS, etc."
+    echo "  5. Summary — consolidated findings"
     echo
     echo -e "${BOLD}Output:${RESET}"
-    echo "  ./recon/<IP>/      Recon results (users, shares, hashes, etc.)"
-    echo "  ./loot/<IP>/       Downloaded share files (spider_plus)"
-    echo "  ./nmap/<IP>/       All nmap scan results (or custom -o dir)"
+    echo "  ./recon/         Recon results + zbulim.log"
+    echo "  ./loot/          Downloaded files (FTP, SMB shares)"
+    echo "  ./nmap/          All nmap scan results"
     echo
     echo -e "${BOLD}Examples:${RESET}"
-    echo "  zbulim 10.10.10.1"
-    echo "  zbulim 10.10.10.0/24"
-    echo "  zbulim 10.10.10.1 10.10.10.2 10.10.10.3"
-    echo "  zbulim 10.10.10.1 -o ./scans"
-    echo "  zbulim 10.10.10.1 --local-auth"
-    echo "  zbulim 10.10.10.1 --skip-nmap"
-    echo "  sudo zbulim 10.10.10.1       # enables UDP scans"
+    echo "  sudo zbulim 10.10.10.1"
+    echo "  sudo zbulim 10.10.10.0/24"
+    echo "  sudo zbulim 10.10.10.1 -o ./scans --local-auth"
     exit 0
-}
-
-extract_open_ports() {
-    local gnmap_file="$1"
-    local proto="$2"
-    grep -oP "\d+(?=/open/${proto})" "$gnmap_file" | paste -sd, || true
-}
-
-elapsed() {
-    local secs=$(( $(date +%s) - START_TIME ))
-    printf "%dm%02ds" $(( secs / 60 )) $(( secs % 60 ))
 }
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -214,17 +103,16 @@ done
 [[ ${#TARGETS[@]} -eq 0 ]] && banner && usage
 
 START_TIME=$(date +%s)
-
 banner
 
-# ── Require sudo ──────────────────────────────────────────────────────────────
+# ── Require root ──────────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
     fail "zbulim must run as root (sudo). Needed for clock sync, UDP scans, /etc/hosts."
-    info "Re-run with: ${BOLD}sudo zbulim ${*}${RESET}"
+    info "Re-run with: ${BOLD}sudo zbulim ${TARGETS[*]}${RESET}"
     exit 1
 fi
 
-# ── CIDR expansion — ping sweep to discover live hosts ────────────────────────
+# ── CIDR expansion ────────────────────────────────────────────────────────────
 EXPANDED_TARGETS=()
 for T in "${TARGETS[@]}"; do
     if [[ "$T" =~ / ]]; then
@@ -248,19 +136,75 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# ── --local-auth passthrough flag ─────────────────────────────────────────────
-NXC_LOCAL_FLAG=""
-$LOCAL_AUTH && NXC_LOCAL_FLAG="--local-auth"
-
 info "Targets : ${BOLD}${TARGETS[*]}${RESET}"
 info "Nmap    : ${BOLD}${OUTDIR_BASE}/${RESET}"
 $SKIP_NMAP   && info "Nmap    : ${BOLD}${YELLOW}SKIPPED${RESET}"
 $SKIP_CLOCK  && info "Clock   : ${BOLD}${YELLOW}SKIPPED${RESET}"
-$LOCAL_AUTH  && info "Auth    : ${BOLD}${YELLOW}--local-auth enabled${RESET}"
+$LOCAL_AUTH   && info "Auth    : ${BOLD}${YELLOW}--local-auth${RESET}"
 info "Started : $(date '+%Y-%m-%d %H:%M:%S')"
 echo
 
-SPIDER_SRC="$HOME/.nxc/modules/nxc_spider_plus"
+# ═══════════════════════════════════════════════════════════════════════════════
+# count_modules — count how many modules will run for this target
+# ═══════════════════════════════════════════════════════════════════════════════
+count_modules() {
+    local ports="$1"
+    local count=0
+    echo ",$ports," | grep -q ',21,'    && (( count++ )) || true
+    echo ",$ports," | grep -q ',22,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',25,|,587,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',53,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',80,|,443,|,8080,|,8443,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',88,'    && (( count++ )) || true
+    echo ",$ports," | grep -qP ',111,|,2049,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',135,'   && (( count++ )) || true
+    echo ",$ports," | grep -qP ',139,|,445,' && (( count++ )) || true
+    echo ",$ports," | grep -qP ',389,|,636,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',1433,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',3306,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',3389,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',5432,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',5900,'  && (( count++ )) || true
+    echo ",$ports," | grep -qP ',5985,|,5986,' && (( count++ )) || true
+    echo ",$ports," | grep -q ',6379,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',8009,'  && (( count++ )) || true
+    echo ",$ports," | grep -q ',27017,' && (( count++ )) || true
+    echo "$count"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# run_port_modules — run the right module for each open port
+# ═══════════════════════════════════════════════════════════════════════════════
+run_port_modules() {
+    local target="$1"
+    local ports="$2"
+
+    [[ -z "$ports" ]] && return
+
+    # order: SMB first (gets hostname/domain), then HTTP (gets domain), then rest
+    echo ",$ports," | grep -qP ',139,|,445,' && enum_smb "$target"
+    echo ",$ports," | grep -qP ',80,|,443,|,8080,|,8443,' && enum_http "$target" "$OUTDIR"
+    echo ",$ports," | grep -q ',53,'    && enum_dns "$target"
+    echo ",$ports," | grep -q ',21,'    && enum_ftp "$target"
+    echo ",$ports," | grep -q ',22,'    && enum_ssh "$target"
+    echo ",$ports," | grep -qP ',25,|,587,'  && enum_smtp "$target"
+    echo ",$ports," | grep -q ',88,'    && enum_kerberos "$target"
+    echo ",$ports," | grep -qP ',111,|,2049,' && enum_nfs "$target"
+    echo ",$ports," | grep -q ',135,'   && enum_rpc "$target"
+    echo ",$ports," | grep -qP ',389,|,636,' && enum_ldap "$target"
+    echo ",$ports," | grep -q ',1433,'  && enum_mssql "$target"
+    echo ",$ports," | grep -q ',3306,'  && enum_mysql "$target"
+    echo ",$ports," | grep -q ',3389,'  && enum_rdp "$target"
+    echo ",$ports," | grep -q ',5432,'  && enum_postgresql "$target"
+    echo ",$ports," | grep -q ',5900,'  && enum_vnc "$target"
+    echo ",$ports," | grep -qP ',5985,|,5986,' && enum_winrm "$target"
+    echo ",$ports," | grep -q ',6379,'  && enum_redis "$target"
+    echo ",$ports," | grep -q ',8009,'  && enum_ajp "$target"
+    echo ",$ports," | grep -q ',27017,' && enum_mongodb "$target"
+
+    # deferred DNS (needs DOMAIN from SMB or HTTP)
+    echo ",$ports," | grep -q ',53,' && enum_dns_deferred "$target"
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # run_recon — main recon logic for a single target
@@ -281,15 +225,19 @@ run_recon() {
     mkdir -p "$OUTDIR" "$RECONDIR"
     chown -R "$REAL_USER:$REAL_GROUP" "$RECONDIR" "$OUTDIR" 2>/dev/null || true
 
+    # ── Log file ──────────────────────────────────────────────────────────────
+    LOGFILE="${RECONDIR}/zbulim.log"
+    touch "$LOGFILE"
+    fix_owner "$LOGFILE"
+
     # ── Per-target state ──────────────────────────────────────────────────────
     TCP_PORTS=""
     UDP_PORTS=""
     NULL_AUTH=false
     GUEST_AUTH=false
-    SHARES_SPIDERED=false
     DOMAIN=""
     HOSTNAME=""
-    NMAP_PID=""
+    DNS_DEFERRED=false
     LOCKOUT_THRESHOLD="?"
     MIN_PW_LEN="?"
     PW_COMPLEX="?"
@@ -300,775 +248,157 @@ run_recon() {
     echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════════════════════════╝${RESET}"
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Clock Sync
+    # Phase 0: Setup
     # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=0
+
     if $SKIP_CLOCK; then
-        section "Clock Sync — SKIPPED (--skip-clock)"
+        info "Clock sync: SKIPPED"
     else
-        section "Clock Sync"
         if command -v ntpdate &>/dev/null; then
-            info "Syncing clock with target (ntpdate)..."
+            info "Syncing clock with target..."
             if ntpdate -s "$TARGET" 2>/dev/null; then
                 success "Clock synced with ${BOLD}${TARGET}${RESET}"
             else
-                warn "ntpdate failed — clock may be out of sync with DC."
-                info "Kerberos-based attacks may fail if clock skew > 5 minutes."
+                warn "ntpdate failed — Kerberos attacks may fail if clock skew > 5 min."
             fi
-        else
-            warn "ntpdate not found — skipping clock sync."
-            info "Install with: ${BOLD}sudo apt install ntpdate${RESET}"
         fi
     fi
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # TCP — Full Port Scan launched in background
-    # SMB enumeration will start immediately in parallel
+    # Phase 1: Discovery
     # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=1
+    local QUICK_PORTS=""
+    local FULL_PID=""
+    local UDP_PID=""
+
     if $SKIP_NMAP; then
-        section "TCP Port Discovery — SKIPPED (--skip-nmap)"
+        section "Scans — SKIPPED (--skip-nmap)"
         if [[ -f "${OUTDIR}/tcp-allports.gnmap" ]]; then
             TCP_PORTS=$(extract_open_ports "${OUTDIR}/tcp-allports.gnmap" tcp)
-            [[ -n "$TCP_PORTS" ]] && info "Loaded previous TCP ports: ${TCP_PORTS}"
+            [[ -n "$TCP_PORTS" ]] && info "Loaded previous TCP: ${TCP_PORTS}"
+        elif [[ -f "${OUTDIR}/tcp-quick.gnmap" ]]; then
+            TCP_PORTS=$(extract_open_ports "${OUTDIR}/tcp-quick.gnmap" tcp)
+            [[ -n "$TCP_PORTS" ]] && info "Loaded previous quick scan: ${TCP_PORTS}"
         else
-            info "No previous scan found — protocol checks will run ungated."
+            info "No previous scan found — all modules will run ungated."
         fi
-    else
-        section "TCP — Full Port Discovery (background)"
-        info "Launching full TCP scan in background (all 65535 ports)..."
-        nmap -p- --min-rate 10000 -Pn -oA "${OUTDIR}/tcp-allports" "$TARGET" \
-            > /dev/null 2>&1 &
-        NMAP_PID=$!
-        info "nmap PID ${BOLD}${NMAP_PID}${RESET} — SMB checks starting in parallel..."
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SMB Enumeration — starts immediately while nmap runs in background
-    # TCP_PORTS is empty at this point → port_open returns true (ungated)
-    # ═══════════════════════════════════════════════════════════════════════════
-    if port_open 445 || port_open 139; then
-        section "SMB Enumeration"
-
-        if ! command -v nxc &>/dev/null; then
-            warn "nxc not found — skipping SMB enumeration phase."
-        else
-            # ── Host discovery + /etc/hosts ───────────────────────────────────
-            info "Enumerating target via SMB..."
-            rm -f "${RECONDIR}/hosts"
-            NXC_INIT=$(nxc smb "$TARGET" $NXC_LOCAL_FLAG \
-                --generate-hosts-file "${RECONDIR}/hosts" 2>&1) || true
-            if [[ -s "${RECONDIR}/hosts" ]]; then
-                sort -u "${RECONDIR}/hosts" > "${RECONDIR}/hosts.tmp" \
-                    && mv "${RECONDIR}/hosts.tmp" "${RECONDIR}/hosts"
-                fix_owner "${RECONDIR}/hosts"
-            else
-                rm -f "${RECONDIR}/hosts"
-            fi
-
-            INIT_STRIPPED=$(echo "$NXC_INIT" | sed 's/\x1b\[[0-9;]*m//g')
-            HOSTNAME=$(echo "$INIT_STRIPPED" | grep -oP 'name:\K[^\s\)]+' | head -1) || true
-            DOMAIN=$(echo "$INIT_STRIPPED"   | grep -oP 'domain:\K[^\s\)]+' | head -1) || true
-
-            [[ -n "$HOSTNAME" ]] && success "Hostname: ${BOLD}${HOSTNAME}${RESET}"
-            [[ -n "$DOMAIN"   ]] && success "Domain  : ${BOLD}${DOMAIN}${RESET}"
-
-            if [[ -s "${RECONDIR}/hosts" ]]; then
-                HOSTS_ENTRY=$(head -1 "${RECONDIR}/hosts")
-                success "Hosts entry: ${BOLD}${HOSTS_ENTRY}${RESET}"
-
-                if grep -qF "$TARGET" /etc/hosts 2>/dev/null; then
-                    warn "Target already present in /etc/hosts — skipping."
-                else
-                    if sudo tee -a /etc/hosts < "${RECONDIR}/hosts" > /dev/null 2>&1; then
-                        success "Appended to /etc/hosts"
-                    else
-                        warn "Could not append to /etc/hosts. Run manually:"
-                        echo -e "  ${DIM}cat ${RECONDIR}/hosts | sudo tee -a /etc/hosts${RESET}"
-                    fi
-                fi
-            else
-                warn "nxc returned no host info — SMB may not be available."
-            fi
-
-            # ── Null session ──────────────────────────────────────────────────
-            info "Testing null session..."
-            NXC_NULL=$(nxc smb "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            nxc_result "$NXC_NULL"
-
-            if echo "$NXC_NULL" | grep -qP '\[\+\]'; then
-                NULL_AUTH=true
-                alert "$YELLOW" \
-                    "NULL SESSION AUTHENTICATED" \
-                    "Anonymous access is allowed on this target." \
-                    "Shares, users, and further enum will use null creds."
-            fi
-
-            # ── Guest login ───────────────────────────────────────────────────
-            info "Testing guest login..."
-            NXC_GUEST=$(nxc smb "$TARGET" -u 'guest' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            nxc_result "$NXC_GUEST"
-
-            if echo "$NXC_GUEST" | grep -qP '\[\+\]'; then
-                GUEST_AUTH=true
-                alert "$YELLOW" \
-                    "GUEST LOGIN AUTHENTICATED" \
-                    "Guest account is active on this target." \
-                    "Shares, users, and further enum will use guest creds."
-            fi
-
-            # ── SMB signing ───────────────────────────────────────────────────
-            info "Checking SMB signing..."
-            nxc smb "$TARGET" $NXC_LOCAL_FLAG \
-                --gen-relay-list "${RECONDIR}/signing-off.txt" > /dev/null 2>&1 || true
-            rm_if_empty "${RECONDIR}/signing-off.txt"
-            fix_owner "${RECONDIR}/signing-off.txt"
-
-            if [[ -s "${RECONDIR}/signing-off.txt" ]]; then
-                alert "$YELLOW" \
-                    "SMB SIGNING NOT REQUIRED" \
-                    "Target is vulnerable to SMB relay attacks." \
-                    "Saved to: ${RECONDIR}/signing-off.txt"
-            else
-                info "SMB signing is required — relay not possible."
-            fi
-
-            # ── Password policy ───────────────────────────────────────────────
-            if $NULL_AUTH || $GUEST_AUTH; then
-                info "Enumerating password policy..."
-                local PP_USER PP_PASS
-                if $NULL_AUTH; then PP_USER=''; PP_PASS=''; else PP_USER='guest'; PP_PASS=''; fi
-                PASSPOL_OUT=$(nxc smb "$TARGET" -u "$PP_USER" -p "$PP_PASS" \
-                    $NXC_LOCAL_FLAG --pass-pol 2>&1) || true
-                PASSPOL_STRIPPED=$(echo "$PASSPOL_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-                LOCKOUT_THRESHOLD=$(echo "$PASSPOL_STRIPPED" | \
-                    grep -oP 'Account Lockout Threshold:\s*\K\S+' | head -1 || echo "?")
-                MIN_PW_LEN=$(echo "$PASSPOL_STRIPPED" | \
-                    grep -oP 'Minimum password length:\s*\K\S+' | head -1 || echo "?")
-                PW_COMPLEX=$(echo "$PASSPOL_STRIPPED" | \
-                    grep -oP 'Domain Password Complex:\s*\K\S+' | head -1 || echo "?")
-                if [[ "$LOCKOUT_THRESHOLD" != "?" ]]; then
-                    success "Lockout threshold: ${BOLD}${LOCKOUT_THRESHOLD}${RESET} | Min pw length: ${BOLD}${MIN_PW_LEN}${RESET} | Complexity: ${BOLD}${PW_COMPLEX}${RESET}"
-                fi
-            fi
-
-            # ── Share + User enumeration ──────────────────────────────────────
-            if $NULL_AUTH || $GUEST_AUTH; then
-                section "Share + User Enumeration"
-
-                if $NULL_AUTH; then
-                    info "Enumerating shares via null session..."
-                    SHARES_OUT=$(nxc smb "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG \
-                        --shares 2>&1) || true
-                    echo "$SHARES_OUT" | safe_write "${RECONDIR}/shares-null.txt" || true
-                    if [[ -s "${RECONDIR}/shares-null.txt" ]]; then
-                        SHARE_COUNT=$(grep -cP 'READ|WRITE' "${RECONDIR}/shares-null.txt" || true)
-                        success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${RECONDIR}/shares-null.txt"
-                        echo "$SHARES_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
-                            sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                            { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
-                            while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
-                    fi
-
-                    info "Enumerating users via null session..."
-                    USERS_OUT=$(nxc smb "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG \
-                        --users --users-export "${RECONDIR}/users-null.txt" 2>&1) || true
-                    rm_if_empty "${RECONDIR}/users-null.txt"
-                    fix_owner "${RECONDIR}/users-null.txt"
-                    if [[ -s "${RECONDIR}/users-null.txt" ]]; then
-                        USER_COUNT=$(wc -l < "${RECONDIR}/users-null.txt")
-                        success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${RECONDIR}/users-null.txt"
-                        echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
-                            sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                            { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
-                            awk '!seen[$0]++' | \
-                            while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
-                        merge_users "${RECONDIR}/users-null.txt"
-                    else
-                        warn "No users returned via null session."
-                    fi
-                fi
-
-                if $GUEST_AUTH; then
-                    info "Enumerating shares via guest login..."
-                    SHARES_OUT=$(nxc smb "$TARGET" -u 'guest' -p '' $NXC_LOCAL_FLAG \
-                        --shares 2>&1) || true
-                    echo "$SHARES_OUT" | safe_write "${RECONDIR}/shares-guest.txt" || true
-                    if [[ -s "${RECONDIR}/shares-guest.txt" ]]; then
-                        SHARE_COUNT=$(grep -cP 'READ|WRITE' "${RECONDIR}/shares-guest.txt" || true)
-                        success "Found ${BOLD}${SHARE_COUNT}${RESET} accessible shares — saved to ${RECONDIR}/shares-guest.txt"
-                        echo "$SHARES_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
-                            sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                            { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
-                            while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
-                    fi
-
-                    info "Enumerating users via guest login..."
-                    USERS_OUT=$(nxc smb "$TARGET" -u 'guest' -p '' $NXC_LOCAL_FLAG \
-                        --users --users-export "${RECONDIR}/users-guest.txt" 2>&1) || true
-                    rm_if_empty "${RECONDIR}/users-guest.txt"
-                    fix_owner "${RECONDIR}/users-guest.txt"
-                    if [[ -s "${RECONDIR}/users-guest.txt" ]]; then
-                        USER_COUNT=$(wc -l < "${RECONDIR}/users-guest.txt")
-                        success "Exported ${BOLD}${USER_COUNT}${RESET} users — saved to ${RECONDIR}/users-guest.txt"
-                        echo "$USERS_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
-                            sed 's/^SMB[[:space:]]\+[0-9.]\+[[:space:]]\+[0-9]\+[[:space:]]\+[A-Za-z0-9_-]\+[[:space:]]\+//' | \
-                            { grep -vP '^\[\*\]|^\[\+\]|^\[-\]|^$' || true; } | \
-                            awk '!seen[$0]++' | \
-                            while IFS= read -r line; do echo -e "  ${DIM}${line}${RESET}"; done
-                        merge_users "${RECONDIR}/users-guest.txt"
-                    else
-                        warn "No users returned via guest login."
-                    fi
-                fi
-            fi
-
-            # ── Spider + Download accessible shares ───────────────────────────
-            SPIDER_USER="" SPIDER_PASS="" SPIDER_AUTH=false
-            if $GUEST_AUTH; then
-                GUEST_SHARES=$(grep -cP 'READ' "${RECONDIR}/shares-guest.txt" 2>/dev/null || true)
-                [[ "${GUEST_SHARES:-0}" -gt 0 ]] && SPIDER_USER="guest" SPIDER_AUTH=true
-            fi
-            if ! $SPIDER_AUTH && $NULL_AUTH; then
-                NULL_SHARES=$(grep -cP 'READ' "${RECONDIR}/shares-null.txt" 2>/dev/null || true)
-                [[ "${NULL_SHARES:-0}" -gt 0 ]] && SPIDER_AUTH=true
-            fi
-
-            if $SPIDER_AUTH && ! $SHARES_SPIDERED; then
-                section "Share Download (spider_plus)"
-                info "Spidering and downloading accessible shares..."
-                nxc smb "$TARGET" -u "$SPIDER_USER" -p "$SPIDER_PASS" $NXC_LOCAL_FLAG \
-                    -M spider_plus -o "DOWNLOAD_FLAG=True" > /dev/null 2>&1 || true
-
-                if [[ -d "${SPIDER_SRC}/${TARGET}" ]]; then
-                    mkdir -p "${LOOTDIR}"
-                    cp -r "${SPIDER_SRC}/${TARGET}/." "${LOOTDIR}/" 2>/dev/null || true
-                    [[ -f "${SPIDER_SRC}/${TARGET}.json" ]] && \
-                        cp "${SPIDER_SRC}/${TARGET}.json" "${LOOTDIR}/spider_plus.json" 2>/dev/null || true
-                    chown -R "$REAL_USER:$REAL_GROUP" "$LOOTDIR" 2>/dev/null || true
-
-                    LOOT_FILES=$(find "${LOOTDIR}" -type f ! -name 'spider_plus.json' 2>/dev/null | wc -l || true)
-                    if [[ "$LOOT_FILES" -gt 0 ]]; then
-                        success "Downloaded ${BOLD}${LOOT_FILES}${RESET} file(s) to ${LOOTDIR}/"
-                        find "${LOOTDIR}" -type f ! -name 'spider_plus.json' -printf '  %P\n' 2>/dev/null | \
-                            while IFS= read -r f; do echo -e "  ${DIM}├─ ${f}${RESET}"; done
-                    else
-                        info "Spider completed but no files downloaded (may be empty shares)."
-                        rmdir "${LOOTDIR}" 2>/dev/null || true
-                    fi
-                else
-                    info "No files downloaded by spider_plus."
-                fi
-                SHARES_SPIDERED=true
-            fi
-
-            # ── RID Brute Force (SMB) — anonymous then guest ──────────────────
-            section "RID Brute Force (User Enumeration)"
-
-            info "RID brute via SMB (anonymous)..."
-            RID_OUT=$(nxc smb "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG --rid-brute 2>&1) || true
-            parse_rid_brute "$RID_OUT" "${RECONDIR}/rid-brute-smb.txt"
-            if [[ -s "${RECONDIR}/rid-brute-smb.txt" ]]; then
-                RID_COUNT=$(wc -l < "${RECONDIR}/rid-brute-smb.txt")
-                success "RID brute found ${BOLD}${RID_COUNT}${RESET} users (anon) — saved to ${RECONDIR}/rid-brute-smb.txt"
-                merge_users "${RECONDIR}/rid-brute-smb.txt"
-            else
-                warn "No users found via anonymous RID brute."
-            fi
-
-            if $GUEST_AUTH; then
-                info "RID brute via SMB guest session..."
-                RID_OUT=$(nxc smb "$TARGET" -u 'guest' -p '' $NXC_LOCAL_FLAG --rid-brute 2>&1) || true
-                parse_rid_brute "$RID_OUT" "${RECONDIR}/rid-brute-smb-guest.txt"
-                if [[ -s "${RECONDIR}/rid-brute-smb-guest.txt" ]]; then
-                    RID_COUNT=$(wc -l < "${RECONDIR}/rid-brute-smb-guest.txt")
-                    success "RID brute found ${BOLD}${RID_COUNT}${RESET} users (guest) — saved to ${RECONDIR}/rid-brute-smb-guest.txt"
-                    merge_users "${RECONDIR}/rid-brute-smb-guest.txt"
-                else
-                    warn "No users found via SMB guest RID brute."
-                fi
-            fi
-        fi
-    else
-        section "SMB Enumeration — SKIPPED (ports 445/139 not open)"
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Wait for background nmap to complete, then extract open ports
-    # All subsequent checks are gated on real TCP_PORTS
-    # ═══════════════════════════════════════════════════════════════════════════
-    if [[ -n "${NMAP_PID:-}" ]]; then
-        section "TCP — Waiting for Background Scan"
-        info "Waiting for nmap (PID ${NMAP_PID}) to finish..."
-        wait "$NMAP_PID" || true
-        for f in "${OUTDIR}"/tcp-allports.*; do fix_owner "$f" 2>/dev/null || true; done
-
-        TCP_PORTS=$(extract_open_ports "${OUTDIR}/tcp-allports.gnmap" tcp)
-        if [[ -z "$TCP_PORTS" ]]; then
-            warn "No open TCP ports found."
-        else
-            success "Open TCP ports: ${BOLD}${TCP_PORTS}${RESET}"
-        fi
-    fi
-
-    # ── MSSQL RID brute — now properly gated on port 1433 ────────────────────
-    if port_open 1433 && command -v nxc &>/dev/null; then
-        info "Trying RID brute via MSSQL..."
-        MSSQL_RID_OUT=$(nxc mssql "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG --rid-brute 2>&1) || true
-        parse_rid_brute "$MSSQL_RID_OUT" "${RECONDIR}/rid-brute-mssql.txt"
-        if [[ -s "${RECONDIR}/rid-brute-mssql.txt" ]]; then
-            MSSQL_RID_COUNT=$(wc -l < "${RECONDIR}/rid-brute-mssql.txt")
-            success "RID brute found ${BOLD}${MSSQL_RID_COUNT}${RESET} users via MSSQL — saved to ${RECONDIR}/rid-brute-mssql.txt"
-            merge_users "${RECONDIR}/rid-brute-mssql.txt"
-        else
-            info "MSSQL RID brute: no results."
-        fi
-    fi
-
-    if [[ -s "${RECONDIR}/users.txt" ]]; then
-        TOTAL_USERS=$(wc -l < "${RECONDIR}/users.txt")
-        success "Unified users.txt: ${BOLD}${TOTAL_USERS}${RESET} unique users"
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Kerbrute — user enum via Kerberos when no null/guest auth
-    # ═══════════════════════════════════════════════════════════════════════════
-    if ! $NULL_AUTH && ! $GUEST_AUTH && port_open 88; then
-        section "Kerbrute User Enumeration"
-
-        if ! command -v kerbrute &>/dev/null; then
-            warn "kerbrute not found — skipping Kerberos user enum."
-            info "Install: https://github.com/ropnop/kerbrute/releases"
-        elif [[ -z "$DOMAIN" ]]; then
-            warn "Domain not detected — cannot run kerbrute (no domain context)."
-        else
-            KERB_WL=""
-            for wl in \
-                /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt \
-                /usr/share/seclists/Usernames/Names/names.txt \
-                /usr/share/wordlists/seclists/Usernames/Names/names.txt \
-                /usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt; do
-                [[ -f "$wl" ]] && KERB_WL="$wl" && break
-            done
-
-            if [[ -z "$KERB_WL" ]]; then
-                warn "kerbrute: no username wordlist found — install seclists."
-                info "Install: sudo apt install seclists"
-            else
-                info "Kerbrute userenum: domain=${BOLD}${DOMAIN}${RESET} dc=${BOLD}${TARGET}${RESET}"
-                info "Wordlist: ${DIM}${KERB_WL}${RESET}"
-                KERB_RAW=$(mktemp)
-                kerbrute userenum --dc "$TARGET" -d "$DOMAIN" "$KERB_WL" \
-                    --output "$KERB_RAW" 2>&1 | grep -E 'VALID|ERROR|Done' | head -20 || true
-                if [[ -s "$KERB_RAW" ]]; then
-                    grep -oP 'VALID USERNAME:\s+\K\S+' "$KERB_RAW" | \
-                        sed 's/@.*//' | sort -u | \
-                        safe_write "${RECONDIR}/kerbrute-users.txt" || true
-                fi
-                rm -f "$KERB_RAW"
-                fix_owner "${RECONDIR}/kerbrute-users.txt"
-                if [[ -s "${RECONDIR}/kerbrute-users.txt" ]]; then
-                    KERB_COUNT=$(wc -l < "${RECONDIR}/kerbrute-users.txt")
-                    success "Kerbrute found ${BOLD}${KERB_COUNT}${RESET} valid users — saved to ${RECONDIR}/kerbrute-users.txt"
-                    merge_users "${RECONDIR}/kerbrute-users.txt"
-                    TOTAL_USERS=$(wc -l < "${RECONDIR}/users.txt")
-                    success "Unified users.txt: ${BOLD}${TOTAL_USERS}${RESET} unique users"
-                else
-                    info "Kerbrute: no valid users found."
-                fi
-            fi
-        fi
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # LDAP Enumeration — ASREPRoast, Kerberoast, Delegation (gated on 389/636)
-    # ═══════════════════════════════════════════════════════════════════════════
-    if port_open 389 || port_open 636; then
-        section "LDAP Enumeration"
-
-        if ! command -v nxc &>/dev/null; then
-            warn "nxc not found — skipping LDAP enumeration."
-        else
-            # ── ASREPRoast ────────────────────────────────────────────────────
-            if [[ -s "${RECONDIR}/users.txt" ]]; then
-                info "Testing ASREPRoast with user list..."
-                ASREP_OUT=$(nxc ldap "$TARGET" -u "${RECONDIR}/users.txt" -p '' \
-                    $NXC_LOCAL_FLAG --asreproast "${RECONDIR}/asreproast.txt" 2>&1) || true
-                rm_if_empty "${RECONDIR}/asreproast.txt"
-                fix_owner "${RECONDIR}/asreproast.txt"
-
-                if [[ -s "${RECONDIR}/asreproast.txt" ]]; then
-                    ASREP_COUNT=$(grep -c '$krb5asrep$' "${RECONDIR}/asreproast.txt" || true)
-                    if [[ "$ASREP_COUNT" -gt 0 ]]; then
-                        alert "$GREEN" \
-                            "AS-REP ROASTABLE ACCOUNTS FOUND" \
-                            "${ASREP_COUNT} account(s) do not require pre-auth." \
-                            "Hashes saved to: ${RECONDIR}/asreproast.txt" \
-                            "Crack with: hashcat -m 18200 asreproast.txt wordlist"
-                    else
-                        info "No AS-REP roastable accounts found."
-                        rm -f "${RECONDIR}/asreproast.txt"
-                    fi
-                else
-                    info "No AS-REP roastable accounts found."
-                fi
-            else
-                warn "No users.txt available — skipping ASREPRoast."
-            fi
-
-            # ── Kerberoasting ─────────────────────────────────────────────────
-            info "Testing Kerberoasting..."
-            local KERB_USER KERB_PASS
-            if $NULL_AUTH; then KERB_USER=''; KERB_PASS='';
-            elif $GUEST_AUTH; then KERB_USER='guest'; KERB_PASS='';
-            else KERB_USER=''; KERB_PASS=''; fi
-            KERB_OUT=$(nxc ldap "$TARGET" -u "$KERB_USER" -p "$KERB_PASS" $NXC_LOCAL_FLAG \
-                --kerberoasting "${RECONDIR}/kerberoast.txt" 2>&1 | tr -d '\0') || true
-            rm_if_empty "${RECONDIR}/kerberoast.txt"
-            fix_owner "${RECONDIR}/kerberoast.txt"
-
-            if [[ -s "${RECONDIR}/kerberoast.txt" ]]; then
-                KERB_COUNT=$(grep -c '$krb5tgs$' "${RECONDIR}/kerberoast.txt" || true)
-                if [[ "$KERB_COUNT" -gt 0 ]]; then
-                    alert "$GREEN" \
-                        "KERBEROASTABLE ACCOUNTS FOUND" \
-                        "${KERB_COUNT} service account(s) with SPNs." \
-                        "Hashes saved to: ${RECONDIR}/kerberoast.txt" \
-                        "Crack with: hashcat -m 13100 kerberoast.txt wordlist"
-                else
-                    info "No Kerberoastable accounts found."
-                    rm -f "${RECONDIR}/kerberoast.txt"
-                fi
-            else
-                info "No Kerberoastable accounts found."
-            fi
-
-            # ── LDAP user enum (fallback if no users yet) ─────────────────────
-            if [[ ! -s "${RECONDIR}/users.txt" ]]; then
-                info "Trying LDAP user enumeration..."
-                local LDAP_USER LDAP_PASS
-                if $NULL_AUTH; then LDAP_USER=''; LDAP_PASS='';
-                elif $GUEST_AUTH; then LDAP_USER='guest'; LDAP_PASS='';
-                else LDAP_USER=''; LDAP_PASS=''; fi
-                nxc ldap "$TARGET" -u "$LDAP_USER" -p "$LDAP_PASS" $NXC_LOCAL_FLAG \
-                    --users --users-export "${RECONDIR}/users-ldap.txt" > /dev/null 2>&1 || true
-                rm_if_empty "${RECONDIR}/users-ldap.txt"
-                fix_owner "${RECONDIR}/users-ldap.txt"
-                if [[ -s "${RECONDIR}/users-ldap.txt" ]]; then
-                    merge_users "${RECONDIR}/users-ldap.txt"
-                    LDAP_COUNT=$(wc -l < "${RECONDIR}/users-ldap.txt")
-                    success "LDAP user enum found ${BOLD}${LDAP_COUNT}${RESET} users"
-                fi
-            fi
-
-            # ── Delegation + PASSWD_NOTREQD + adminCount ─────────────────────
-            if $NULL_AUTH || $GUEST_AUTH; then
-                local DELEG_USER DELEG_PASS
-                if $NULL_AUTH; then DELEG_USER=''; DELEG_PASS='';
-                else DELEG_USER='guest'; DELEG_PASS=''; fi
-
-                info "Checking for delegation relationships..."
-                DELEG_OUT=$(nxc ldap "$TARGET" -u "$DELEG_USER" -p "$DELEG_PASS" \
-                    $NXC_LOCAL_FLAG --find-delegation 2>&1 | tr -d '\0') || true
-                DELEG_STRIPPED=$(echo "$DELEG_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-                if echo "$DELEG_STRIPPED" | grep -qiP 'Unconstrained|Constrained|Resource'; then
-                    success "Delegation relationships found!"
-                    echo "$DELEG_OUT"
-                else
-                    info "No delegation relationships found."
-                fi
-
-                info "Checking for PASSWD_NOTREQD accounts..."
-                PWNR_OUT=$(nxc ldap "$TARGET" -u "$DELEG_USER" -p "$DELEG_PASS" \
-                    $NXC_LOCAL_FLAG --password-not-required 2>&1 | tr -d '\0') || true
-                PWNR_ACTIVE=$(echo "$PWNR_OUT" | sed 's/\x1b\[[0-9;]*m//g' | \
-                    grep -P 'User:' | grep -v -i 'disabled' || true)
-                if [[ -n "$PWNR_ACTIVE" ]]; then
-                    success "Accounts with PASSWD_NOTREQD flag found"
-                    echo "$PWNR_OUT"
-                else
-                    info "No PASSWD_NOTREQD accounts."
-                fi
-
-                info "Checking for adminCount=1 users..."
-                ADMIN_OUT=$(nxc ldap "$TARGET" -u "$DELEG_USER" -p "$DELEG_PASS" \
-                    $NXC_LOCAL_FLAG --admin-count 2>&1 | tr -d '\0') || true
-                ADMIN_STRIPPED=$(echo "$ADMIN_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-                if echo "$ADMIN_STRIPPED" | grep -qiP 'adminCount=1|User:.*admin'; then
-                    success "Privileged accounts (adminCount=1) found"
-                    echo "$ADMIN_OUT"
-                else
-                    info "No adminCount=1 users found."
-                fi
-            fi
-        fi
-    else
-        section "LDAP Enumeration — SKIPPED (ports 389/636 not open)"
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Multi-Protocol Checks (each gated on its port)
-    # ═══════════════════════════════════════════════════════════════════════════
-    section "Multi-Protocol Recon"
-
-    if command -v nxc &>/dev/null; then
-        if port_open 3389; then
-            info "Checking RDP..."
-            RDP_OUT=$(nxc rdp "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            RDP_STRIPPED=$(echo "$RDP_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$RDP_STRIPPED" | grep -qP '\[\+\]'; then
-                success "RDP: accessible"; nxc_result "$RDP_OUT"
-            elif echo "$RDP_STRIPPED" | grep -qP 'RDP'; then
-                info "RDP: port open, auth required"
-            else
-                info "RDP: not available."
-            fi
-        else
-            info "RDP (3389): not open — skipping."
-        fi
-
-        if port_open 5985 || port_open 5986; then
-            info "Checking WinRM..."
-            WINRM_OUT=$(nxc winrm "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            WINRM_STRIPPED=$(echo "$WINRM_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$WINRM_STRIPPED" | grep -qP '\[\+\]'; then
-                success "WinRM: accessible"; nxc_result "$WINRM_OUT"
-            elif echo "$WINRM_STRIPPED" | grep -qP 'WINRM|HTTP'; then
-                info "WinRM: port open, auth required"
-            else
-                info "WinRM: not available."
-            fi
-        else
-            info "WinRM (5985/5986): not open — skipping."
-        fi
-
-        if port_open 1433; then
-            info "Checking MSSQL..."
-            MSSQL_OUT=$(nxc mssql "$TARGET" -u '' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            MSSQL_STRIPPED=$(echo "$MSSQL_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$MSSQL_STRIPPED" | grep -qP '\[\+\]'; then
-                success "MSSQL: accessible"; nxc_result "$MSSQL_OUT"
-            elif echo "$MSSQL_STRIPPED" | grep -qP 'MSSQL'; then
-                info "MSSQL: port open, auth required"
-            else
-                info "MSSQL: not available."
-            fi
-        else
-            info "MSSQL (1433): not open — skipping."
-        fi
-
-        if port_open 21; then
-            info "Checking FTP..."
-            FTP_OUT=$(timeout 15 nxc ftp "$TARGET" -u 'anonymous' -p '' $NXC_LOCAL_FLAG 2>&1) || true
-            FTP_STRIPPED=$(echo "$FTP_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$FTP_STRIPPED" | grep -qP '\[\+\]'; then
-                success "FTP: anonymous access!"; nxc_result "$FTP_OUT"
-            elif echo "$FTP_STRIPPED" | grep -qP 'FTP'; then
-                info "FTP: port open, anonymous login denied"
-            else
-                info "FTP: not available."
-            fi
-        else
-            info "FTP (21): not open — skipping."
-        fi
-
-        if port_open 22; then
-            info "Checking SSH..."
-            SSH_OUT=$(timeout 15 nxc ssh "$TARGET" -u '' -p '' 2>&1) || true
-            SSH_STRIPPED=$(echo "$SSH_OUT" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$SSH_STRIPPED" | grep -qP 'SSH'; then
-                info "SSH: port open"
-            else
-                info "SSH: not available."
-            fi
-        else
-            info "SSH (22): not open — skipping."
-        fi
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Web Recon — whatweb + feroxbuster/gobuster (gated on web ports)
-    # ═══════════════════════════════════════════════════════════════════════════
-    if port_open 80 || port_open 443 || port_open 8080 || port_open 8443; then
-        section "Web Recon"
-
-        # Detect best dir-brute tool
-        WEB_BRUTE=""
-        command -v feroxbuster &>/dev/null && WEB_BRUTE="feroxbuster"
-        [[ -z "$WEB_BRUTE" ]] && command -v gobuster &>/dev/null && WEB_BRUTE="gobuster"
-
-        GOBUSTER_WL=""
-        if [[ "$WEB_BRUTE" == "gobuster" ]]; then
-            for wl in \
-                /usr/share/seclists/Discovery/Web-Content/common.txt \
-                /usr/share/wordlists/dirb/common.txt \
-                /usr/share/dirb/wordlists/common.txt; do
-                [[ -f "$wl" ]] && GOBUSTER_WL="$wl" && break
-            done
-        fi
-
-        for PORT in 80 443 8080 8443; do
-            port_open "$PORT" || continue
-
-            [[ "$PORT" == "443" || "$PORT" == "8443" ]] && SCHEME="https" || SCHEME="http"
-            URL="${SCHEME}://${TARGET}:${PORT}"
-
-            info "Web recon: ${BOLD}${URL}${RESET}"
-
-            # whatweb
-            if command -v whatweb &>/dev/null; then
-                info "  whatweb ${URL}..."
-                whatweb --no-errors -a 3 "$URL" 2>/dev/null | \
-                    tee "${RECONDIR}/whatweb-${PORT}.txt" || true
-                fix_owner "${RECONDIR}/whatweb-${PORT}.txt"
-                rm_if_empty "${RECONDIR}/whatweb-${PORT}.txt"
-            else
-                warn "  whatweb not found — skipping tech fingerprint for ${URL}"
-            fi
-
-            # directory brute-force
-            case "$WEB_BRUTE" in
-                feroxbuster)
-                    info "  feroxbuster ${URL}..."
-                    feroxbuster -u "$URL" --silent \
-                        -o "${RECONDIR}/ferox-${PORT}.txt" \
-                        --no-state -t 50 2>/dev/null || true
-                    fix_owner "${RECONDIR}/ferox-${PORT}.txt"
-                    rm_if_empty "${RECONDIR}/ferox-${PORT}.txt"
-                    if [[ -s "${RECONDIR}/ferox-${PORT}.txt" ]]; then
-                        DIR_COUNT=$(wc -l < "${RECONDIR}/ferox-${PORT}.txt")
-                        success "  feroxbuster found ${BOLD}${DIR_COUNT}${RESET} path(s) — ${RECONDIR}/ferox-${PORT}.txt"
-                    fi
-                    ;;
-                gobuster)
-                    if [[ -n "$GOBUSTER_WL" ]]; then
-                        info "  gobuster ${URL}..."
-                        gobuster dir -u "$URL" -w "$GOBUSTER_WL" -q \
-                            -o "${RECONDIR}/gobuster-${PORT}.txt" 2>/dev/null || true
-                        fix_owner "${RECONDIR}/gobuster-${PORT}.txt"
-                        rm_if_empty "${RECONDIR}/gobuster-${PORT}.txt"
-                        if [[ -s "${RECONDIR}/gobuster-${PORT}.txt" ]]; then
-                            DIR_COUNT=$(wc -l < "${RECONDIR}/gobuster-${PORT}.txt")
-                            success "  gobuster found ${BOLD}${DIR_COUNT}${RESET} path(s) — ${RECONDIR}/gobuster-${PORT}.txt"
-                        fi
-                    else
-                        warn "  gobuster: no wordlist found — skipping dir brute for ${URL}"
-                        info "  Install: sudo apt install seclists"
-                    fi
-                    ;;
-                *)
-                    warn "  No dir-brute tool found (feroxbuster/gobuster) — skipping for ${URL}"
-                    ;;
-            esac
-        done
-    else
-        section "Web Recon — SKIPPED (ports 80/443/8080/8443 not open)"
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # TCP — Targeted Version + Script Scan
-    # ═══════════════════════════════════════════════════════════════════════════
-    if ! $SKIP_NMAP && [[ -n "$TCP_PORTS" ]]; then
-        section "TCP — Targeted Version + Script Scan"
-        info "Running -sCV on: ${TCP_PORTS}"
-
-        nmap -p "$TCP_PORTS" -sCV -Pn -oA "${OUTDIR}/tcp-targeted" "$TARGET"
-        for f in "${OUTDIR}"/tcp-targeted.*; do fix_owner "$f"; done
-
-        success "TCP targeted scan complete."
-    fi
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # UDP (root only)
-    # ═══════════════════════════════════════════════════════════════════════════
-    if $SKIP_NMAP; then
-        section "UDP — SKIPPED (--skip-nmap)"
         if [[ -f "${OUTDIR}/udp-allports.gnmap" ]]; then
             UDP_PORTS=$(extract_open_ports "${OUTDIR}/udp-allports.gnmap" udp)
-            [[ -n "$UDP_PORTS" ]] && info "Loaded previous UDP ports: ${UDP_PORTS}"
+            [[ -n "$UDP_PORTS" ]] && info "Loaded previous UDP: ${UDP_PORTS}"
         fi
+        QUICK_PORTS="$TCP_PORTS"
     else
-        section "UDP — Full Port Sweep"
-        info "Running UDP scan (top 1000 ports)..."
+        # quick scan (foreground)
+        QUICK_PORTS=$(run_quick_scan "$TARGET" "$OUTDIR")
+        TCP_PORTS="$QUICK_PORTS"
 
-        nmap -sU --min-rate 5000 --open -Pn -oA "${OUTDIR}/udp-allports" "$TARGET"
-        for f in "${OUTDIR}"/udp-allports.*; do fix_owner "$f"; done
+        # full scan (background)
+        FULL_PID=$(run_full_tcp_scan "$TARGET" "$OUTDIR")
 
-        UDP_PORTS=$(extract_open_ports "${OUTDIR}/udp-allports.gnmap" udp)
+        # UDP scan (background)
+        UDP_PID=$(run_udp_scan "$TARGET" "$OUTDIR")
+    fi
 
-        if [[ -z "$UDP_PORTS" ]]; then
-            warn "No open UDP ports found."
-        else
-            success "Open UDP ports: ${BOLD}${UDP_PORTS}${RESET}"
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 2: Quick Enumeration
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=2
 
-            section "UDP — Targeted Version + Script Scan"
-            info "Running -sUCV on: ${UDP_PORTS}"
+    if [[ -n "$TCP_PORTS" ]]; then
+        TOTAL_MODULES=$(count_modules "$TCP_PORTS")
+        CURRENT_MODULE=0
+        section "Phase 2 — Enumerating open ports"
+        run_port_modules "$TARGET" "$TCP_PORTS"
+    else
+        warn "No open TCP ports to enumerate."
+    fi
 
-            nmap -p "$UDP_PORTS" -sUCV -Pn -oA "${OUTDIR}/udp-targeted" "$TARGET"
-            for f in "${OUTDIR}"/udp-targeted.*; do fix_owner "$f"; done
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 3: Full TCP Scan Results
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=3
 
-            success "UDP targeted scan complete."
+    if [[ -n "${FULL_PID:-}" ]]; then
+        local all_ports
+        all_ports=$(wait_full_tcp_scan "$FULL_PID" "$OUTDIR" "$QUICK_PORTS")
+
+        if [[ -n "$all_ports" ]]; then
+            # find new ports
+            local new_ports=""
+            IFS=',' read -ra ALL_ARR <<< "$all_ports"
+            IFS=',' read -ra QUICK_ARR <<< "${QUICK_PORTS:-}"
+            for p in "${ALL_ARR[@]}"; do
+                local found=false
+                for q in "${QUICK_ARR[@]}"; do
+                    [[ "$p" == "$q" ]] && found=true && break
+                done
+                $found || new_ports="${new_ports:+$new_ports,}$p"
+            done
+
+            TCP_PORTS="$all_ports"
+
+            if [[ -n "$new_ports" ]]; then
+                local new_module_count
+                new_module_count=$(count_modules "$new_ports")
+                if [[ "$new_module_count" -gt 0 ]]; then
+                    TOTAL_MODULES=$new_module_count
+                    CURRENT_MODULE=0
+                    section "Phase 3 — Enumerating newly discovered ports"
+                    run_port_modules "$TARGET" "$new_ports"
+                fi
+            fi
+        fi
+
+        # targeted TCP scan
+        if ! $SKIP_NMAP && [[ -n "$TCP_PORTS" ]]; then
+            run_targeted_tcp_scan "$TARGET" "$OUTDIR" "$TCP_PORTS"
         fi
     fi
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Summary
+    # Phase 4: UDP Results
     # ═══════════════════════════════════════════════════════════════════════════
-    echo
-    echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${RESET}"
-    echo -e "${GREEN}${BOLD}│                     Scan Complete                       │${RESET}"
-    echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${RESET}"
-    echo -e "  ${DIM}Target   :${RESET} ${BOLD}${TARGET}${RESET}"
-    [[ -n "${HOSTNAME}" ]]  && echo -e "  ${DIM}Hostname :${RESET} ${BOLD}${HOSTNAME}${RESET}"
-    [[ -n "${DOMAIN}" ]]    && echo -e "  ${DIM}Domain   :${RESET} ${BOLD}${DOMAIN}${RESET}"
-    [[ -n "${TCP_PORTS}" ]] && echo -e "  ${DIM}TCP      :${RESET} ${TCP_PORTS}"
-    [[ -n "${UDP_PORTS}" ]] && echo -e "  ${DIM}UDP      :${RESET} ${UDP_PORTS}"
-    [[ -s "${RECONDIR}/hosts" ]] && \
-        echo -e "  ${DIM}Hosts    :${RESET} $(head -1 "${RECONDIR}/hosts")"
-    $NULL_AUTH  && echo -e "  ${DIM}Null Auth:${RESET} ${BOLD}${GREEN}Yes${RESET}"
-    $GUEST_AUTH && echo -e "  ${DIM}Guest    :${RESET} ${BOLD}${GREEN}Yes${RESET}"
-    [[ -s "${RECONDIR}/signing-off.txt" ]] && \
-        echo -e "  ${DIM}Signing  :${RESET} ${BOLD}${YELLOW}Not Required${RESET}"
-    [[ -s "${RECONDIR}/users.txt" ]] && \
-        echo -e "  ${DIM}Users    :${RESET} ${BOLD}$(wc -l < "${RECONDIR}/users.txt")${RESET} unique (${RECONDIR}/users.txt)"
-    [[ "$LOCKOUT_THRESHOLD" != "?" ]] && \
-        echo -e "  ${DIM}Lockout  :${RESET} ${BOLD}${LOCKOUT_THRESHOLD}${RESET} | min_len=${BOLD}${MIN_PW_LEN}${RESET} | complexity=${BOLD}${PW_COMPLEX}${RESET}"
-    [[ -d "${LOOTDIR}" ]] && \
-        echo -e "  ${DIM}Loot     :${RESET} ${BOLD}$(find "${LOOTDIR}" -type f ! -name 'spider_plus.json' 2>/dev/null | wc -l)${RESET} file(s) in ${LOOTDIR}/"
-    echo -e "  ${DIM}Elapsed  :${RESET} $(elapsed)"
+    CURRENT_PHASE=4
 
-    echo
-    echo -e "${DIM}Generated files:${RESET}"
-    for f in \
-        "${RECONDIR}/users.txt" \
-        "${RECONDIR}/shares-null.txt" \
-        "${RECONDIR}/shares-guest.txt" \
-        "${RECONDIR}/signing-off.txt" \
-        "${RECONDIR}/asreproast.txt" \
-        "${RECONDIR}/kerberoast.txt" \
-        "${RECONDIR}/kerbrute-users.txt" \
-        "${RECONDIR}/rid-brute-smb.txt" \
-        "${RECONDIR}/rid-brute-smb-guest.txt" \
-        "${RECONDIR}/rid-brute-mssql.txt" \
-        "${RECONDIR}/users-null.txt" \
-        "${RECONDIR}/users-guest.txt" \
-        "${RECONDIR}/users-ldap.txt" \
-        "${RECONDIR}/hosts" \
-        "${RECONDIR}/whatweb-80.txt" \
-        "${RECONDIR}/whatweb-443.txt" \
-        "${RECONDIR}/whatweb-8080.txt" \
-        "${RECONDIR}/whatweb-8443.txt" \
-        "${RECONDIR}/ferox-80.txt" \
-        "${RECONDIR}/ferox-443.txt" \
-        "${RECONDIR}/ferox-8080.txt" \
-        "${RECONDIR}/ferox-8443.txt" \
-        "${RECONDIR}/gobuster-80.txt" \
-        "${RECONDIR}/gobuster-443.txt" \
-        "${RECONDIR}/gobuster-8080.txt" \
-        "${RECONDIR}/gobuster-8443.txt"; do
-        [[ -s "$f" ]] && echo -e "  ${DIM}├─${RESET} ${f} ${DIM}($(wc -l < "$f") lines)${RESET}"
-    done
-    [[ -d "${LOOTDIR}" ]] && echo -e "  ${DIM}├─${RESET} ${LOOTDIR}/ ${DIM}(downloaded share files)${RESET}"
-    [[ -d "$OUTDIR"   ]] && echo -e "  ${DIM}└─${RESET} ${OUTDIR}/ ${DIM}(nmap results)${RESET}"
-    echo
+    if [[ -n "${UDP_PID:-}" ]]; then
+        UDP_PORTS=$(wait_udp_scan "$UDP_PID" "$OUTDIR")
+
+        if [[ -n "$UDP_PORTS" ]]; then
+            # run UDP modules
+            local udp_modules=0
+            echo ",$UDP_PORTS," | grep -q ',161,' && (( udp_modules++ )) || true
+            echo ",$UDP_PORTS," | grep -q ',53,'  && (( udp_modules++ )) || true
+
+            if [[ "$udp_modules" -gt 0 ]]; then
+                TOTAL_MODULES=$udp_modules
+                CURRENT_MODULE=0
+                section "Phase 4 — UDP Enumeration"
+
+                if echo ",$UDP_PORTS," | grep -q ',161,'; then
+                    enum_snmp "$TARGET"
+                fi
+                if echo ",$UDP_PORTS," | grep -q ',53,'; then
+                    # DNS over UDP — run deferred if not done yet
+                    enum_dns_deferred "$TARGET"
+                fi
+            fi
+
+            # targeted UDP scan
+            if ! $SKIP_NMAP; then
+                run_targeted_udp_scan "$TARGET" "$OUTDIR" "$UDP_PORTS"
+            fi
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 5: Summary
+    # ═══════════════════════════════════════════════════════════════════════════
+    CURRENT_PHASE=5
+    print_summary "$TARGET"
+
+    info "Full log: ${LOGFILE}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1080,5 +410,3 @@ done
 
 echo
 echo -e "${GREEN}${BOLD}All ${#TARGETS[@]} target(s) complete.${RESET} Total elapsed: $(elapsed)"
-echo -ne "${DIM}Press Enter to exit zbulim...${RESET}"
-read -r < /dev/tty
